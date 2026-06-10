@@ -34,18 +34,12 @@ jobs:
       run: |
         $installer = "$env:TEMP\vulkan-sdk.exe"
         Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile $installer
-        Start-Process -FilePath $installer -ArgumentList "--accept-license","--default-answer","--confirm-command","install" -Wait -NoNewWindow
+        Start-Process -FilePath $installer -ArgumentList "--accept-license","--default-answer","--confirm-command","install","--root","C:\VulkanSDK" -Wait -NoNewWindow
         Remove-Item $installer
-
-    - name: Locate Vulkan SDK (Windows)
-      if: runner.os == 'Windows'
-      shell: pwsh
-      run: |
-        $sdk = Get-ChildItem "C:\VulkanSDK" -Directory `
-          | Sort-Object Name -Descending `
-          | Select-Object -First 1
+        $sdk = Get-ChildItem "C:\VulkanSDK" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        if (-not $sdk) { Write-Error "Vulkan SDK not found after install"; exit 1 }
         "VULKAN_SDK=$($sdk.FullName)" >> $env:GITHUB_ENV
-        echo "Found Vulkan SDK at $($sdk.FullName)"
+        Write-Host "VULKAN_SDK=$($sdk.FullName)"
 
     - name: Configure
       run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
