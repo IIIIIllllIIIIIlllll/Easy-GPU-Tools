@@ -34,7 +34,7 @@ jobs:
       run: |
         $installer = "$env:TEMP\vulkan-sdk.exe"
         Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile $installer
-        Start-Process -FilePath $installer -ArgumentList "--accept-license","--default-answer","--confirm-command","install","--root","C:\VulkanSDK" -Wait -NoNewWindow
+        Start-Process -FilePath $installer -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait -NoNewWindow
         Remove-Item $installer
         $sdk = Get-ChildItem "C:\VulkanSDK" -Directory | Sort-Object Name -Descending | Select-Object -First 1
         if (-not $sdk) { Write-Error "Vulkan SDK not found after install"; exit 1 }
