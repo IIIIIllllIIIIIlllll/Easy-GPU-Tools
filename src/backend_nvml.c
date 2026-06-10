@@ -117,8 +117,17 @@ static PFN_nvmlDeviceGetPerformanceState     pfn_GetPState = NULL;
 static PFN_nvmlDeviceGetEccMode              pfn_GetEcc = NULL;
 static PFN_nvmlSystemGetDriverVersion        pfn_DrvVer = NULL;
 
+typedef struct {
+    unsigned int domain;
+    unsigned int bus;
+    unsigned int device;
+    unsigned int function;
+    int          valid;
+} NvmlPciInfo;
+
 static unsigned int  g_num_devices = 0;
 static nvmlDevice_t  g_devices[NVML_MAX_DEVICES];
+static NvmlPciInfo   g_pci_info[NVML_MAX_DEVICES];
 
 /* ------------------------------------------------------------------
  *  Helper macro
@@ -150,7 +159,7 @@ int nvml_init(void)
         !RESOLVE(pfn_GetCount, "nvmlDeviceGetCount")) goto fail;
     if (!RESOLVE(pfn_GetHandleByIndex, "nvmlDeviceGetHandleByIndex_v2") &&
         !RESOLVE(pfn_GetHandleByIndex, "nvmlDeviceGetHandleByIndex")) goto fail;
-    /* GetPciInfo is optional -- we don't use it for matching yet */
+    /* GetPciInfo is needed for matching identical GPU models */
     RESOLVE(pfn_GetPciInfo, "nvmlDeviceGetPciInfo_v3");
 
     RESOLVE(pfn_GetTemp,      "nvmlDeviceGetTemperature");
@@ -172,9 +181,17 @@ int nvml_init(void)
     if (g_num_devices > NVML_MAX_DEVICES) g_num_devices = NVML_MAX_DEVICES;
 
     for (i = 0; i < g_num_devices; i++) {
+        nvmlPciInfo_t pci = {0};
         g_devices[i] = NULL;
         r = pfn_GetHandleByIndex(i, &g_devices[i]);
         if (r != NVML_SUCCESS) continue;
+        if (pfn_GetPciInfo && pfn_GetPciInfo(g_devices[i], &pci) == NVML_SUCCESS) {
+            g_pci_info[i].domain   = pci.domain;
+            g_pci_info[i].bus      = pci.bus;
+            g_pci_info[i].device   = pci.device;
+            g_pci_info[i].function = pci.function;
+            g_pci_info[i].valid    = 1;
+        }
     }
 
     g_init_ok = 1;
@@ -199,21 +216,31 @@ void nvml_shutdown(void)
         g_lib = NULL;
     }
     memset(g_devices, 0, sizeof(g_devices));
+    memset(g_pci_info, 0, sizeof(g_pci_info));
     g_num_devices = 0;
     g_init_ok = 0;
 }
 
 /* ------------------------------------------------------------------
- *  nvml_find_by_device_id
+ *  nvml_find_by_pci
  * ------------------------------------------------------------------ */
 
-int nvml_find_by_device_id(unsigned int device_id, int *index)
+int nvml_find_by_pci(unsigned int domain, unsigned int bus,
+                     unsigned int device, unsigned int function,
+                     int *index)
 {
-    (void)device_id;
+    unsigned int i;
     if (g_init_ok <= 0) return -1;
-    if (g_num_devices > 0 && g_devices[0]) {
-        *index = 0;
-        return 0;
+    for (i = 0; i < g_num_devices; i++) {
+        if (!g_devices[i]) continue;
+        if (!g_pci_info[i].valid) continue;
+        if (g_pci_info[i].domain   == domain &&
+            g_pci_info[i].bus      == bus &&
+            g_pci_info[i].device   == device &&
+            g_pci_info[i].function == function) {
+            *index = (int)i;
+            return 0;
+        }
     }
     return -1;
 }

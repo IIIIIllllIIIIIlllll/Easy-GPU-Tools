@@ -22,9 +22,11 @@ int nvml_init(void);
 /* Shutdown NVML and unload library. Safe to call anytime. */
 void nvml_shutdown(void);
 
-/* Match a Vulkan NVIDIA device by PCI device ID.
+/* Match a Vulkan NVIDIA device by PCI topology (domain:bus:device.function).
  * Returns 0 and sets *index on success, -1 if not found. */
-int nvml_find_by_device_id(unsigned int device_id, int *index);
+int nvml_find_by_pci(unsigned int domain, unsigned int bus,
+                     unsigned int device, unsigned int function,
+                     int *index);
 
 /* GPU edge temperature in degrees Celsius. 0 = success. */
 int nvml_get_temperature(int idx, int *celsius);

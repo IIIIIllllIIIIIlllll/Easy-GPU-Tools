@@ -135,13 +135,19 @@ static void gpu_init_info(GpuInfo *info)
 
 static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
 {
-    VkPhysicalDeviceProperties props;
+    VkPhysicalDeviceProperties2 props2 = {0};
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci_props = {0};
     VkPhysicalDeviceMemoryProperties mem;
 
     gpu_init_info(info);
 
-    vkGetPhysicalDeviceProperties(device, &props);
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &pci_props;
+    pci_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+    vkGetPhysicalDeviceProperties2(device, &props2);
     vkGetPhysicalDeviceMemoryProperties(device, &mem);
+
+    VkPhysicalDeviceProperties props = props2.properties;
 
     /* identification */
     strncpy(info->device_name, props.deviceName, sizeof(info->device_name) - 1);
@@ -173,7 +179,9 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
     /* -- NVIDIA: NVML -------------------------------------------------- */
     if (props.vendorID == 0x10DE) {
         int nv_idx;
-        if (nvml_find_by_device_id(props.deviceID, &nv_idx) == 0) {
+        if (nvml_find_by_pci(pci_props.pciDomain, pci_props.pciBus,
+                             pci_props.pciDevice, pci_props.pciFunction,
+                             &nv_idx) == 0) {
             strncpy(info->sensor_backend, "NVML", sizeof(info->sensor_backend) - 1);
 
             int temp;
@@ -682,17 +690,11 @@ static void print_all_json(const SysInfo *si, const GpuInfo *gpus, int count)
 
 int main(int argc, char *argv[])
 {
-    int show_gpu = 1, show_sys = 0, json_mode = 0;
+    int json_mode = 0;
     int argi;
     for (argi = 1; argi < argc; argi++) {
         if (strcmp(argv[argi], "--json") == 0) {
             json_mode = 1;
-        } else if (strcmp(argv[argi], "--sysinfo") == 0) {
-            show_gpu = 0;
-            show_sys = 1;
-        } else if (strcmp(argv[argi], "--all") == 0) {
-            show_gpu = 1;
-            show_sys = 1;
         }
     }
 
@@ -709,7 +711,7 @@ int main(int argc, char *argv[])
     app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     app_info.pEngineName = "gpu-info";
     app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    app_info.apiVersion = VK_API_VERSION_1_0;
+    app_info.apiVersion = VK_API_VERSION_1_1;
 
     VkInstanceCreateInfo instance_ci = {0};
     instance_ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -766,16 +768,14 @@ int main(int argc, char *argv[])
 
     /* -- output ----------------------------------------------------------- */
 
-    /* collect system info if needed (does not require Vulkan) */
+    /* collect system info */
     SysInfo si;
     memset(&si, 0, sizeof(si));
-    if (show_sys) {
-        sys_collect_info(&si);
-    }
+    sys_collect_info(&si);
 
     /* collect GPU data into structs when JSON is requested */
     GpuInfo *gpus = NULL;
-    if (show_gpu && json_mode) {
+    if (json_mode) {
         gpus = (GpuInfo*)calloc((size_t)device_count, sizeof(GpuInfo));
         if (!gpus) {
             fprintf(stderr, "calloc failed\n");
@@ -788,8 +788,8 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* -- GPU text output (shared by default and --all text mode) -- */
-    if (show_gpu && !json_mode) {
+    /* -- GPU text output -- */
+    if (!json_mode) {
         uint32_t total = 0;
 
         printf("===== GPU Information (Vulkan + ADL/sysfs + NVML) =====\n");
@@ -931,8 +931,17 @@ int main(int argc, char *argv[])
             /* -- NVML dynamic info for NVIDIA GPUs (cross-platform) ------------- */
             if (props.vendorID == 0x10DE) {
                 int nv_idx;
+                VkPhysicalDeviceProperties2 nv_props2 = {0};
+                VkPhysicalDevicePCIBusInfoPropertiesEXT nv_pci = {0};
+                nv_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                nv_props2.pNext = &nv_pci;
+                nv_pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+                vkGetPhysicalDeviceProperties2(phys_devices[i], &nv_props2);
+
                 printf("\n  --- NVIDIA Dynamic Info (NVML) ---\n");
-                if (nvml_find_by_device_id(props.deviceID, &nv_idx) == 0) {
+                if (nvml_find_by_pci(nv_pci.pciDomain, nv_pci.pciBus,
+                                     nv_pci.pciDevice, nv_pci.pciFunction,
+                                     &nv_idx) == 0) {
                     int temp, gpu_pct, mem_pct, sm_mhz, mem_clk;
                     int power_usage, power_limit, fan_pct, pstate, ecc;
                     unsigned int mem_used, mem_total;
@@ -1010,25 +1019,12 @@ int main(int argc, char *argv[])
         printf("Total: %u GPU(s) detected.\n", total);
     }
 
-    /* -- GPU JSON output (--json with no --sysinfo) -- */
-    if (show_gpu && json_mode && !show_sys) {
-        gpu_print_json(gpus, (int)device_count);
-    }
-
     /* -- system info output -- */
-    if (show_sys) {
-        if (show_gpu && !json_mode) {
-            putchar('\n');
-        }
-        if (json_mode) {
-            if (show_gpu) {
-                print_all_json(&si, gpus, (int)device_count);
-            } else {
-                sys_print_json(&si);
-            }
-        } else {
-            sys_print_text(&si);
-        }
+    if (json_mode) {
+        print_all_json(&si, gpus, (int)device_count);
+    } else {
+        putchar('\n');
+        sys_print_text(&si);
     }
 
     free(gpus);
