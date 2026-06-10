@@ -37,6 +37,16 @@ jobs:
         Start-Process -FilePath $installer -ArgumentList "--accept-license","--default-answer","--confirm-command","install" -Wait -NoNewWindow
         Remove-Item $installer
 
+    - name: Locate Vulkan SDK (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $sdk = Get-ChildItem "C:\VulkanSDK" -Directory `
+          | Sort-Object Name -Descending `
+          | Select-Object -First 1
+        "VULKAN_SDK=$($sdk.FullName)" >> $env:GITHUB_ENV
+        echo "Found Vulkan SDK at $($sdk.FullName)"
+
     - name: Configure
       run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 
