@@ -1,0 +1,50 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: gpu-info-linux
+            binary: build/gpu-info
+          - os: windows-latest
+            artifact: gpu-info-windows-x64
+            binary: build/Release/gpu-info.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Vulkan SDK (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libvulkan-dev
+
+    - name: Install Vulkan SDK (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $installer = "$env:TEMP\vulkan-sdk.exe"
+        Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile $installer
+        Start-Process -FilePath $installer -ArgumentList "--accept-license","--default-answer","--confirm-command","install" -Wait -NoNewWindow
+        Remove-Item $installer
+
+    - name: Configure
+      run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      run: cmake --build build --config Release
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact }}
+        path: ${{ matrix.binary }}
