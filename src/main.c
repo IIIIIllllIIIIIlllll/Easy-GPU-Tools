@@ -776,6 +776,19 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* -- filter out llvmpipe software renderers --------------------------- */
+    {
+        uint32_t keep = 0;
+        for (i = 0; i < device_count; i++) {
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(phys_devices[i], &props);
+            if (strstr(props.deviceName, "llvmpipe")) continue;
+            if (keep != i) phys_devices[keep] = phys_devices[i];
+            keep++;
+        }
+        device_count = keep;
+    }
+
     /* -- output ----------------------------------------------------------- */
 
     /* collect system info */

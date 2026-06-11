@@ -18,6 +18,10 @@ add_executable(gpu-info
     src/backend_sysinfo.c
 )
 
+if(MSVC)
+    target_compile_definitions(gpu-info PRIVATE _CRT_DECLARE_NONSTDC_NAMES=1)
+endif()
+
 target_link_libraries(gpu-info PRIVATE Vulkan::Vulkan)
 
 if(UNIX)
