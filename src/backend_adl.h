@@ -18,6 +18,10 @@ void adl_shutdown(void);
  * Returns 0 and sets *adl_index on success, -1 if not found. */
 int adl_find_by_name(const char *name, int *adl_index);
 
+/* Find an ADL adapter by PCI vendor/device ID (exact match).
+ * Returns 0 and sets *adl_index on success, -1 if not found. */
+int adl_find_by_pci(uint32_t vendor_id, uint32_t device_id, int *adl_index);
+
 /* ADL_Overdrive5_Temperature_Get.
  * Returns temperature in millidegrees Celsius. 0 on success, -1 on failure. */
 int adl_get_temperature(int adapter_index, int *temp_milli_c);
@@ -50,6 +54,8 @@ static inline int adl_init(void)           { return -1; }
 static inline void adl_shutdown(void)      {}
 static inline int adl_find_by_name(const char *n, int *i)
     { (void)n; (void)i; return -1; }
+static inline int adl_find_by_pci(uint32_t v, uint32_t d, int *i)
+    { (void)v; (void)d; (void)i; return -1; }
 static inline int adl_get_temperature(int idx, int *t)
     { (void)idx; (void)t; return -1; }
 static inline int adl_get_fan_speed(int idx, int *r, int *p)

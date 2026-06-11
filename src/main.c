@@ -237,7 +237,7 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
     else if (props.vendorID == 0x1002) {
 #if defined(_WIN32)
         int adl_idx;
-        if (adl_find_by_name(props.deviceName, &adl_idx) == 0) {
+        if (adl_find_by_pci(props.vendorID, props.deviceID, &adl_idx) == 0) {
             strncpy(info->sensor_backend, "ADL", sizeof(info->sensor_backend) - 1);
 
             int t;

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdint.h>
 
 #include "backend_adl.h"
 
@@ -252,6 +253,24 @@ int adl_find_by_name(const char *name, int *adl_index)
 }
 
 /* ------------------------------------------------------------------
+ *  adl_find_by_pci
+ * ------------------------------------------------------------------ */
+
+int adl_find_by_pci(uint32_t vendor_id, uint32_t device_id, int *adl_index)
+{
+    int i;
+    if (g_init_ok <= 0 || !g_adapters) return -1;
+    for (i = 0; i < g_num_adapters; i++) {
+        if ((uint32_t)g_adapters[i].iVendorID  == vendor_id &&
+            (uint32_t)g_adapters[i].iDeviceID  == device_id) {
+            *adl_index = i;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* ------------------------------------------------------------------
  *  Query helpers  --  try OverdriveN first, fall back to Overdrive5
  * ------------------------------------------------------------------ */
 
@@ -317,10 +336,10 @@ int adl_get_fan_speed(int idx, int *rpm, int *percent)
 }
 
 int adl_get_activity(int idx,
-                     int *eng_clock_10khz,
-                     int *mem_clock_10khz,
-                     int *activity_pct,
-                     int *perf_level)
+                      int *eng_clock_10khz,
+                      int *mem_clock_10khz,
+                      int *activity_pct,
+                      int *perf_level)
 {
     /* try OverdriveN */
     if (pfn_ODN_Perf) {

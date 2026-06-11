@@ -52,9 +52,14 @@ typedef struct {
 
 typedef struct {
     unsigned int version;
-    unsigned int gpu;
-    unsigned int memory;
-} nvmlUtilization_t;
+    unsigned long long timestamp;
+    unsigned int sm;
+    unsigned int mem;
+    unsigned int enc;
+    unsigned int dec;
+    unsigned int jpeg;
+    unsigned int ofa;
+} nvmlTotalUtilization_t;
 
 typedef struct {
     unsigned int version;
@@ -73,7 +78,7 @@ typedef int (*PFN_nvmlDeviceGetCount_v2)(unsigned int*);
 typedef int (*PFN_nvmlDeviceGetHandleByIndex_v2)(unsigned int, nvmlDevice_t*);
 typedef int (*PFN_nvmlDeviceGetPciInfo_v3)(nvmlDevice_t, nvmlPciInfo_t*);
 typedef int (*PFN_nvmlDeviceGetTemperature)(nvmlDevice_t, int, unsigned int*);
-typedef int (*PFN_nvmlDeviceGetUtilizationRates)(nvmlDevice_t, nvmlUtilization_t*);
+typedef int (*PFN_nvmlDeviceGetTotalUtilization)(nvmlDevice_t, nvmlTotalUtilization_t*);
 typedef int (*PFN_nvmlDeviceGetClockInfo)(nvmlDevice_t, int, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetPowerUsage)(nvmlDevice_t, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetPowerManagementLimit)(nvmlDevice_t, unsigned int*);
@@ -107,7 +112,7 @@ static PFN_nvmlDeviceGetCount_v2             pfn_GetCount = NULL;
 static PFN_nvmlDeviceGetHandleByIndex_v2     pfn_GetHandleByIndex = NULL;
 static PFN_nvmlDeviceGetPciInfo_v3           pfn_GetPciInfo = NULL;
 static PFN_nvmlDeviceGetTemperature          pfn_GetTemp = NULL;
-static PFN_nvmlDeviceGetUtilizationRates     pfn_GetUtil = NULL;
+static PFN_nvmlDeviceGetTotalUtilization     pfn_GetUtil = NULL;
 static PFN_nvmlDeviceGetClockInfo            pfn_GetClock = NULL;
 static PFN_nvmlDeviceGetPowerUsage           pfn_GetPower = NULL;
 static PFN_nvmlDeviceGetPowerManagementLimit pfn_GetPowerLimit = NULL;
@@ -164,7 +169,7 @@ int nvml_init(void)
     RESOLVE(pfn_GetPciInfo, "nvmlDeviceGetPciInfo_v3");
 
     RESOLVE(pfn_GetTemp,      "nvmlDeviceGetTemperature");
-    RESOLVE(pfn_GetUtil,      "nvmlDeviceGetUtilizationRates");
+    RESOLVE(pfn_GetUtil,      "nvmlDeviceGetTotalUtilization");
     RESOLVE(pfn_GetClock,     "nvmlDeviceGetClockInfo");
     RESOLVE(pfn_GetPower,     "nvmlDeviceGetPowerUsage");
     RESOLVE(pfn_GetPowerLimit,"nvmlDeviceGetPowerManagementLimit");
@@ -278,13 +283,13 @@ int nvml_get_temperature(int idx, int *celsius)
 
 int nvml_get_utilization(int idx, int *gpu_pct, int *mem_pct)
 {
-    nvmlUtilization_t u = {0};
+    nvmlTotalUtilization_t u = {0};
     CHECK(idx);
     if (!pfn_GetUtil) return -1;
     u.version = sizeof(u);
     if (pfn_GetUtil(g_devices[idx], &u) != NVML_SUCCESS) return -1;
-    *gpu_pct = (int)u.gpu;
-    *mem_pct = (int)u.memory;
+    *gpu_pct = (int)u.sm;
+    *mem_pct = (int)u.mem;
     return 0;
 }
 
