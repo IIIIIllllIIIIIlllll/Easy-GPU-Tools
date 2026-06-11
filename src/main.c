@@ -684,6 +684,13 @@ static void print_all_json(const SysInfo *si, const GpuInfo *gpus, int count)
     fputs("\n}\n", stdout);
 }
 
+static void print_gpu_json(const GpuInfo *gpus, int count)
+{
+    fputs("{\n", stdout);
+    gpu_json_write_devices(gpus, count);
+    fputs("\n}\n", stdout);
+}
+
 /* ================================================================
  *  Core
  * ================================================================ */
@@ -691,10 +698,13 @@ static void print_all_json(const SysInfo *si, const GpuInfo *gpus, int count)
 int main(int argc, char *argv[])
 {
     int json_mode = 0;
+    int gpu_only = 0;
     int argi;
     for (argi = 1; argi < argc; argi++) {
         if (strcmp(argv[argi], "--json") == 0) {
             json_mode = 1;
+        } else if (strcmp(argv[argi], "--gpu") == 0) {
+            gpu_only = 1;
         }
     }
 
@@ -771,7 +781,8 @@ int main(int argc, char *argv[])
     /* collect system info */
     SysInfo si;
     memset(&si, 0, sizeof(si));
-    sys_collect_info(&si);
+    if (!gpu_only)
+        sys_collect_info(&si);
 
     /* collect GPU data into structs when JSON is requested */
     GpuInfo *gpus = NULL;
@@ -1020,11 +1031,15 @@ int main(int argc, char *argv[])
     }
 
     /* -- system info output -- */
-    if (json_mode) {
-        print_all_json(&si, gpus, (int)device_count);
-    } else {
-        putchar('\n');
-        sys_print_text(&si);
+    if (!gpu_only) {
+        if (json_mode) {
+            print_all_json(&si, gpus, (int)device_count);
+        } else {
+            putchar('\n');
+            sys_print_text(&si);
+        }
+    } else if (json_mode) {
+        print_gpu_json(gpus, (int)device_count);
     }
 
     free(gpus);

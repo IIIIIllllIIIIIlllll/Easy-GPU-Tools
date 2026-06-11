@@ -35,8 +35,10 @@ cmake --build build
 ## Usage
 
 ```
-gpu-info                  # GPU info, human-readable text (default)
-gpu-info --json           # GPU info, machine-readable JSON
+gpu-info                  # GPU info + system info, human-readable text (default)
+gpu-info --json           # GPU info + system info, machine-readable JSON
+gpu-info --gpu            # GPU info only (skip system info)
+gpu-info --gpu --json     # GPU info only, JSON
 gpu-info --sysinfo        # System info (OS/CPU/RAM/Disk), human-readable text
 gpu-info --sysinfo --json # System info, JSON
 gpu-info --all            # GPU + system info, text
