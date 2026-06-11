@@ -123,8 +123,8 @@ int sysfs_init(void)
 
     while ((de = readdir(drm)) != NULL) {
         char dev_path[PATH_MAX + 64];
-        char vendor_path[PATH_MAX + 64];
-        char test_path[PATH_MAX + 64];
+        char vendor_path[PATH_MAX + 128];
+        char test_path[PATH_MAX + 128];
         int vendor_id, device_id;
 
         /* only process cardN (skip renderD*, version, etc.) */

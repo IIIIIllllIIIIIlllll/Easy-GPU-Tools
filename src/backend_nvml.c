@@ -16,7 +16,6 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
-#include <unistd.h>
 #endif
 
 #include "backend_nvml.h"
@@ -295,43 +294,48 @@ int nvml_get_utilization(int idx, int *gpu_pct, int *mem_pct)
     CHECK(idx);
 
     /*
-     * nvmlDeviceGetUtilizationRates depends on the driver's internal
-     * sampling window (~1 s).  A freshly-spawned process reading it
-     * immediately will get a stale / zero value.
-     *
-     * Workaround: use nvmlDeviceGetTotalUtilization (cumulative since
-     * boot) and take two samples 500 ms apart.  The delta gives us a
-     * reliable instantaneous rate regardless of process lifetime.
+     * Primary: query nvidia-smi directly.
+     * nvidia-smi uses the same driver path as the NVML API but its
+     * output is what users see in the terminal, and it handles the
+     * sampling window correctly.
      */
-    if (pfn_GetUtil) {
-        nvmlTotalUtilization_t u0 = {0}, u1 = {0};
-        u0.version = sizeof(u0);
-        u1.version = sizeof(u1);
+    {
+        char cmd[256];
+        FILE *fp;
 
-        if (pfn_GetUtil(g_devices[idx], &u0) == NVML_SUCCESS) {
-#ifdef _WIN32
-            Sleep(500);
-#else
-            usleep(500000);
-#endif
-            if (pfn_GetUtil(g_devices[idx], &u1) == NVML_SUCCESS) {
-                unsigned long long elapsed_ms =
-                    u1.timestamp - u0.timestamp;
+        snprintf(cmd, sizeof(cmd),
+            "nvidia-smi --id=%d --query-gpu=utilization.gpu,utilization.memory "
+            "--format=csv,noheader,nounits 2>nul", idx);
+        fp = popen(cmd, "r");
+        if (fp) {
+            char line[256];
+            if (fgets(line, sizeof(line), fp)) {
+                /* Strip trailing whitespace / newline */
+                size_t len = strlen(line);
+                while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'
+                                   || line[len-1] == ' '))
+                    line[--len] = '\0';
 
-                if (elapsed_ms > 0) {
-                    /* Scale to percentage: delta / elapsed * 100 */
-                    *gpu_pct = (int)((u1.sm - u0.sm) * 100ULL / elapsed_ms);
-                    *mem_pct = (int)((u1.mem - u0.mem) * 100ULL / elapsed_ms);
-                } else {
-                    *gpu_pct = (int)u1.sm;
-                    *mem_pct = (int)u1.mem;
+                /* Parse "85, 42" style CSV */
+                int gpu, mem;
+                if (sscanf(line, "%d, %d", &gpu, &mem) == 2) {
+                    /* Clamp to 0-100 */
+                    if (gpu < 0) gpu = 0;
+                    if (gpu > 100) gpu = 100;
+                    if (mem < 0) mem = 0;
+                    if (mem > 100) mem = 100;
+
+                    *gpu_pct = gpu;
+                    *mem_pct = mem;
+                    pclose(fp);
+                    return 0;
                 }
-                return 0;
             }
+            pclose(fp);
         }
     }
 
-    /* Final fallback */
+    /* Fallback: NVML API (rates) */
     if (pfn_GetUtilRates) {
         nvmlUtilization_t u = {0};
         if (pfn_GetUtilRates(g_devices[idx], &u) == NVML_SUCCESS) {
@@ -339,6 +343,16 @@ int nvml_get_utilization(int idx, int *gpu_pct, int *mem_pct)
             *mem_pct  = (int)u.memory;
             return 0;
         }
+    }
+
+    /* Final fallback: total utilization (cumulative) */
+    if (pfn_GetUtil) {
+        nvmlTotalUtilization_t u = {0};
+        u.version = sizeof(u);
+        if (pfn_GetUtil(g_devices[idx], &u) != NVML_SUCCESS) return -1;
+        *gpu_pct = (int)u.sm;
+        *mem_pct = (int)u.mem;
+        return 0;
     }
     return -1;
 }
