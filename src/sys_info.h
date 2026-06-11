@@ -15,7 +15,7 @@ typedef struct {
     char     os_version[64];
     char     os_arch[16];
     char     host_name[128];
-    char     kernel[128];
+    char     kernel[256];
     uint64_t uptime_seconds;
 
     /* CPU */

@@ -16,6 +16,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 #include "backend_nvml.h"
@@ -62,6 +63,11 @@ typedef struct {
 } nvmlTotalUtilization_t;
 
 typedef struct {
+    unsigned int gpu;
+    unsigned int memory;
+} nvmlUtilization_t;
+
+typedef struct {
     unsigned int version;
     unsigned long long total;   /* bytes */
     unsigned long long free;
@@ -79,6 +85,7 @@ typedef int (*PFN_nvmlDeviceGetHandleByIndex_v2)(unsigned int, nvmlDevice_t*);
 typedef int (*PFN_nvmlDeviceGetPciInfo_v3)(nvmlDevice_t, nvmlPciInfo_t*);
 typedef int (*PFN_nvmlDeviceGetTemperature)(nvmlDevice_t, int, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetTotalUtilization)(nvmlDevice_t, nvmlTotalUtilization_t*);
+typedef int (*PFN_nvmlDeviceGetUtilizationRates)(nvmlDevice_t, nvmlUtilization_t*);
 typedef int (*PFN_nvmlDeviceGetClockInfo)(nvmlDevice_t, int, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetPowerUsage)(nvmlDevice_t, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetPowerManagementLimit)(nvmlDevice_t, unsigned int*);
@@ -113,6 +120,7 @@ static PFN_nvmlDeviceGetHandleByIndex_v2     pfn_GetHandleByIndex = NULL;
 static PFN_nvmlDeviceGetPciInfo_v3           pfn_GetPciInfo = NULL;
 static PFN_nvmlDeviceGetTemperature          pfn_GetTemp = NULL;
 static PFN_nvmlDeviceGetTotalUtilization     pfn_GetUtil = NULL;
+static PFN_nvmlDeviceGetUtilizationRates     pfn_GetUtilRates = NULL;
 static PFN_nvmlDeviceGetClockInfo            pfn_GetClock = NULL;
 static PFN_nvmlDeviceGetPowerUsage           pfn_GetPower = NULL;
 static PFN_nvmlDeviceGetPowerManagementLimit pfn_GetPowerLimit = NULL;
@@ -170,6 +178,7 @@ int nvml_init(void)
 
     RESOLVE(pfn_GetTemp,      "nvmlDeviceGetTemperature");
     RESOLVE(pfn_GetUtil,      "nvmlDeviceGetTotalUtilization");
+    RESOLVE(pfn_GetUtilRates, "nvmlDeviceGetUtilizationRates");
     RESOLVE(pfn_GetClock,     "nvmlDeviceGetClockInfo");
     RESOLVE(pfn_GetPower,     "nvmlDeviceGetPowerUsage");
     RESOLVE(pfn_GetPowerLimit,"nvmlDeviceGetPowerManagementLimit");
@@ -283,14 +292,55 @@ int nvml_get_temperature(int idx, int *celsius)
 
 int nvml_get_utilization(int idx, int *gpu_pct, int *mem_pct)
 {
-    nvmlTotalUtilization_t u = {0};
     CHECK(idx);
-    if (!pfn_GetUtil) return -1;
-    u.version = sizeof(u);
-    if (pfn_GetUtil(g_devices[idx], &u) != NVML_SUCCESS) return -1;
-    *gpu_pct = (int)u.sm;
-    *mem_pct = (int)u.mem;
-    return 0;
+
+    /*
+     * nvmlDeviceGetUtilizationRates depends on the driver's internal
+     * sampling window (~1 s).  A freshly-spawned process reading it
+     * immediately will get a stale / zero value.
+     *
+     * Workaround: use nvmlDeviceGetTotalUtilization (cumulative since
+     * boot) and take two samples 500 ms apart.  The delta gives us a
+     * reliable instantaneous rate regardless of process lifetime.
+     */
+    if (pfn_GetUtil) {
+        nvmlTotalUtilization_t u0 = {0}, u1 = {0};
+        u0.version = sizeof(u0);
+        u1.version = sizeof(u1);
+
+        if (pfn_GetUtil(g_devices[idx], &u0) == NVML_SUCCESS) {
+#ifdef _WIN32
+            Sleep(500);
+#else
+            usleep(500000);
+#endif
+            if (pfn_GetUtil(g_devices[idx], &u1) == NVML_SUCCESS) {
+                unsigned long long elapsed_ms =
+                    u1.timestamp - u0.timestamp;
+
+                if (elapsed_ms > 0) {
+                    /* Scale to percentage: delta / elapsed * 100 */
+                    *gpu_pct = (int)((u1.sm - u0.sm) * 100ULL / elapsed_ms);
+                    *mem_pct = (int)((u1.mem - u0.mem) * 100ULL / elapsed_ms);
+                } else {
+                    *gpu_pct = (int)u1.sm;
+                    *mem_pct = (int)u1.mem;
+                }
+                return 0;
+            }
+        }
+    }
+
+    /* Final fallback */
+    if (pfn_GetUtilRates) {
+        nvmlUtilization_t u = {0};
+        if (pfn_GetUtilRates(g_devices[idx], &u) == NVML_SUCCESS) {
+            *gpu_pct  = (int)u.gpu;
+            *mem_pct  = (int)u.memory;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 int nvml_get_clocks(int idx, int *sm_mhz, int *mem_mhz)

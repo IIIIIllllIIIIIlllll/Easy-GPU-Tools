@@ -15,6 +15,7 @@
 #include <string.h>
 #include <errno.h>
 #include <dirent.h>
+#include <limits.h>
 #include <sys/types.h>
 
 #include "backend_sysfs.h"
@@ -24,14 +25,13 @@
  * ------------------------------------------------------------------ */
 
 #define MAX_GPUS   16
-#define PATH_MAX_L 256
 
 typedef struct {
     int  vendor_id;
     int  device_id;
-    char card_path[PATH_MAX_L];   /* /sys/class/drm/cardN         */
-    char hwmon_path[PATH_MAX_L];  /* .../device/hwmon/hwmonX     */
-    char dev_path[PATH_MAX_L];    /* .../device                   */
+    char card_path[PATH_MAX + 64];   /* /sys/class/drm/cardN         */
+    char hwmon_path[PATH_MAX + 64];  /* .../device/hwmon/hwmonX     */
+    char dev_path[PATH_MAX + 64];    /* .../device                   */
     int  valid;
 } SysfsGpu;
 
@@ -84,7 +84,7 @@ static void make_path(char *dst, size_t sz, const char *dir, const char *file)
 /* Find the first hwmon directory under <dev_path>/hwmon/. */
 static int find_hwmon(const char *dev_path, char *out, size_t out_sz)
 {
-    char hwmon_dir[PATH_MAX_L + 64];
+     char hwmon_dir[PATH_MAX + 128];
     DIR *d;
     struct dirent *de;
 
@@ -122,9 +122,9 @@ int sysfs_init(void)
     memset(g_gpus, 0, sizeof(g_gpus));
 
     while ((de = readdir(drm)) != NULL) {
-        char dev_path[PATH_MAX_L + 64];
-        char vendor_path[PATH_MAX_L + 64];
-        char test_path[PATH_MAX_L + 64];
+        char dev_path[PATH_MAX + 64];
+        char vendor_path[PATH_MAX + 64];
+        char test_path[PATH_MAX + 64];
         int vendor_id, device_id;
 
         /* only process cardN (skip renderD*, version, etc.) */
@@ -150,9 +150,9 @@ int sysfs_init(void)
         i = g_num_gpus;
         g_gpus[i].vendor_id = vendor_id;
         g_gpus[i].device_id = device_id;
-        snprintf(g_gpus[i].card_path, PATH_MAX_L,
-                 "/sys/class/drm/%s", de->d_name);
-        snprintf(g_gpus[i].dev_path, PATH_MAX_L, "%s", dev_path);
+       snprintf(g_gpus[i].card_path, sizeof(g_gpus[i].card_path),
+                  "/sys/class/drm/%s", de->d_name);
+        snprintf(g_gpus[i].dev_path, sizeof(g_gpus[i].dev_path), "%s", dev_path);
         g_gpus[i].hwmon_path[0] = '\0';
 
         /* locate hwmon */
@@ -204,7 +204,7 @@ int sysfs_find_by_vendor_device(int vendor_id, int device_id, int *gpu_index)
 
 int sysfs_get_temperature(int idx, int *milli_c)
 {
-    char p[PATH_MAX_L + 64];
+    char p[PATH_MAX + 64];
     if (idx < 0 || idx >= g_num_gpus || !g_gpus[idx].valid)
         return -1;
 
@@ -217,7 +217,7 @@ int sysfs_get_temperature(int idx, int *milli_c)
 
 int sysfs_get_utilization(int idx, int *percent)
 {
-    char p[PATH_MAX_L + 64];
+    char p[PATH_MAX + 64];
     if (idx < 0 || idx >= g_num_gpus || !g_gpus[idx].valid)
         return -1;
 
@@ -227,7 +227,7 @@ int sysfs_get_utilization(int idx, int *percent)
 
 int sysfs_get_clocks(int idx, int *core_mhz, int *mem_mhz)
 {
-    char p[PATH_MAX_L + 64];
+    char p[PATH_MAX + 64];
     unsigned long long val;
     int ok = 0;
 
@@ -252,7 +252,7 @@ int sysfs_get_clocks(int idx, int *core_mhz, int *mem_mhz)
 
 int sysfs_get_power(int idx, int *milliwatts)
 {
-    char p[PATH_MAX_L + 64];
+    char p[PATH_MAX + 64];
     unsigned long long val;
 
     if (idx < 0 || idx >= g_num_gpus || !g_gpus[idx].valid)
@@ -270,7 +270,7 @@ int sysfs_get_power(int idx, int *milliwatts)
 
 int sysfs_get_fan(int idx, int *rpm, int *percent)
 {
-    char p[PATH_MAX_L + 64];
+    char p[PATH_MAX + 64];
 
     if (idx < 0 || idx >= g_num_gpus || !g_gpus[idx].valid)
         return -1;
