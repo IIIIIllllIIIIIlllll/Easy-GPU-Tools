@@ -297,12 +297,27 @@ int nvml_get_utilization(int idx, int *gpu_pct, int *mem_pct)
 {
     CHECK(idx);
 
-    /*
-     * Primary: query nvidia-smi directly.
-     * nvidia-smi uses the same driver path as the NVML API but its
-     * output is what users see in the terminal, and it handles the
-     * sampling window correctly.
-     */
+    /* Primary: NVML API (instant, no subprocess overhead) */
+    if (pfn_GetUtilRates) {
+        nvmlUtilization_t u = {0};
+        if (pfn_GetUtilRates(g_devices[idx], &u) == NVML_SUCCESS) {
+            *gpu_pct  = (int)u.gpu;
+            *mem_pct  = (int)u.memory;
+            return 0;
+        }
+    }
+
+    /* Fallback: total utilization (cumulative) */
+    if (pfn_GetUtil) {
+        nvmlTotalUtilization_t u = {0};
+        u.version = sizeof(u);
+        if (pfn_GetUtil(g_devices[idx], &u) != NVML_SUCCESS) return -1;
+        *gpu_pct = (int)u.sm;
+        *mem_pct = (int)u.mem;
+        return 0;
+    }
+
+    /* Last resort: query nvidia-smi via subprocess */
     {
         char cmd[256];
         FILE *fp;
@@ -339,25 +354,6 @@ int nvml_get_utilization(int idx, int *gpu_pct, int *mem_pct)
         }
     }
 
-    /* Fallback: NVML API (rates) */
-    if (pfn_GetUtilRates) {
-        nvmlUtilization_t u = {0};
-        if (pfn_GetUtilRates(g_devices[idx], &u) == NVML_SUCCESS) {
-            *gpu_pct  = (int)u.gpu;
-            *mem_pct  = (int)u.memory;
-            return 0;
-        }
-    }
-
-    /* Final fallback: total utilization (cumulative) */
-    if (pfn_GetUtil) {
-        nvmlTotalUtilization_t u = {0};
-        u.version = sizeof(u);
-        if (pfn_GetUtil(g_devices[idx], &u) != NVML_SUCCESS) return -1;
-        *gpu_pct = (int)u.sm;
-        *mem_pct = (int)u.mem;
-        return 0;
-    }
     return -1;
 }
 
