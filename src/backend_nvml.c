@@ -14,6 +14,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#ifndef _popen
+#define popen _popen
+#define pclose _pclose
+#endif
 #else
 #include <dlfcn.h>
 #endif
