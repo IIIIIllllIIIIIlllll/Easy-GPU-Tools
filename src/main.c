@@ -738,7 +738,6 @@ int main(int argc, char *argv[])
 
     /* -- init Vulkan backend (dynamic loading, linker-free) ------------- */
     if (vulkan_backend_init() != 0) {
-        fprintf(stderr, "Warning: Vulkan loader not found, GPU detection disabled.\n");
         if (gpu_only) {
             fprintf(stderr, "GPU-only mode requested but Vulkan loader is not available.\n");
             return 1;
