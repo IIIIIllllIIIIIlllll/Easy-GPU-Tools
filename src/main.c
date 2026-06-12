@@ -729,14 +729,18 @@ int main(int argc, char *argv[])
 
     vkres = vkCreateInstance(&instance_ci, NULL, &instance);
     if (vkres != VK_SUCCESS) {
-        fprintf(stderr, "vkCreateInstance failed: %d\n", vkres);
+        fprintf(stderr, "Warning: vkCreateInstance failed: %d\n", vkres);
         fprintf(stderr,
                 "Make sure a Vulkan driver is installed.\n"
                 "  Windows: install GPU vendor driver (NVIDIA/AMD/Intel)\n"
                 "  Linux:   apt install vulkan-tools / mesa-vulkan-drivers\n");
-        return 1;
+        if (gpu_only) {
+            fprintf(stderr, "GPU-only mode requested but no GPU is available.\n");
+            return 1;
+        }
     }
 
+    if (instance != VK_NULL_HANDLE) {
     /* -- init ADL (AMD dynamic info, Windows only) ------------------------ */
 #ifdef _WIN32
     if (adl_init() != 0) {
@@ -756,11 +760,16 @@ int main(int argc, char *argv[])
     /* -- enumerate physical devices --------------------------------------- */
     vkres = vkEnumeratePhysicalDevices(instance, &device_count, NULL);
     if (vkres != VK_SUCCESS || device_count == 0) {
-        fprintf(stderr, "No Vulkan-capable GPU found.\n");
+        fprintf(stderr, "Warning: No Vulkan-capable GPU found.\n");
         vkDestroyInstance(instance, NULL);
-        return 1;
+        instance = VK_NULL_HANDLE;
+        if (gpu_only) {
+            return 1;
+        }
+    }
     }
 
+    if (instance != VK_NULL_HANDLE) {
     phys_devices = (VkPhysicalDevice*)malloc(sizeof(VkPhysicalDevice) * device_count);
     if (!phys_devices) {
         fprintf(stderr, "malloc failed\n");
@@ -788,6 +797,7 @@ int main(int argc, char *argv[])
         }
         device_count = keep;
     }
+    }
 
     /* -- output ----------------------------------------------------------- */
 
@@ -799,7 +809,7 @@ int main(int argc, char *argv[])
 
     /* collect GPU data into structs when JSON is requested */
     GpuInfo *gpus = NULL;
-    if (json_mode) {
+    if (json_mode && instance != VK_NULL_HANDLE) {
         gpus = (GpuInfo*)calloc((size_t)device_count, sizeof(GpuInfo));
         if (!gpus) {
             fprintf(stderr, "calloc failed\n");
@@ -813,7 +823,7 @@ int main(int argc, char *argv[])
     }
 
     /* -- GPU text output -- */
-    if (!json_mode) {
+    if (!json_mode && instance != VK_NULL_HANDLE) {
         uint32_t total = 0;
 
         printf("===== GPU Information (Vulkan + ADL/sysfs + NVML) =====\n");
@@ -1046,12 +1056,15 @@ int main(int argc, char *argv[])
     /* -- system info output -- */
     if (!gpu_only) {
         if (json_mode) {
-            print_all_json(&si, gpus, (int)device_count);
+            if (instance != VK_NULL_HANDLE)
+                print_all_json(&si, gpus, (int)device_count);
+            else
+                sys_print_json(&si);
         } else {
             putchar('\n');
             sys_print_text(&si);
         }
-    } else if (json_mode) {
+    } else if (json_mode && instance != VK_NULL_HANDLE) {
         print_gpu_json(gpus, (int)device_count);
     }
 
@@ -1066,7 +1079,8 @@ int main(int argc, char *argv[])
 #ifdef __linux__
     sysfs_shutdown();
 #endif
-    vkDestroyInstance(instance, NULL);
+    if (instance != VK_NULL_HANDLE)
+        vkDestroyInstance(instance, NULL);
 
     return 0;
 }
