@@ -9,6 +9,15 @@
 #include "backend_sysfs.h"
 #include "backend_nvml.h"
 #include "backend_sysinfo.h"
+#include "backend_vulkan.h"
+
+/* Redirect Vulkan API calls through dynamically loaded function pointers */
+#define vkCreateInstance                vulkan_CreateInstance
+#define vkDestroyInstance               vulkan_DestroyInstance
+#define vkEnumeratePhysicalDevices      vulkan_EnumeratePhysicalDevices
+#define vkGetPhysicalDeviceProperties   vulkan_GetPhysicalDeviceProperties
+#define vkGetPhysicalDeviceProperties2  vulkan_GetPhysicalDeviceProperties2
+#define vkGetPhysicalDeviceMemoryProperties vulkan_GetPhysicalDeviceMemoryProperties
 
 /* ================================================================
  *  Utility helpers
@@ -727,16 +736,28 @@ int main(int argc, char *argv[])
     instance_ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instance_ci.pApplicationInfo = &app_info;
 
-    vkres = vkCreateInstance(&instance_ci, NULL, &instance);
-    if (vkres != VK_SUCCESS) {
-        fprintf(stderr, "Warning: vkCreateInstance failed: %d\n", vkres);
-        fprintf(stderr,
-                "Make sure a Vulkan driver is installed.\n"
-                "  Windows: install GPU vendor driver (NVIDIA/AMD/Intel)\n"
-                "  Linux:   apt install vulkan-tools / mesa-vulkan-drivers\n");
+    /* -- init Vulkan backend (dynamic loading, linker-free) ------------- */
+    if (vulkan_backend_init() != 0) {
+        fprintf(stderr, "Warning: Vulkan loader not found, GPU detection disabled.\n");
         if (gpu_only) {
-            fprintf(stderr, "GPU-only mode requested but no GPU is available.\n");
+            fprintf(stderr, "GPU-only mode requested but Vulkan loader is not available.\n");
             return 1;
+        }
+    }
+
+    /* -- create Vulkan instance (only if backend loaded) --------------- */
+    if (vulkan_backend_loaded()) {
+        vkres = vkCreateInstance(&instance_ci, NULL, &instance);
+        if (vkres != VK_SUCCESS) {
+            fprintf(stderr, "Warning: vkCreateInstance failed: %d\n", vkres);
+            fprintf(stderr,
+                    "Make sure a Vulkan driver is installed.\n"
+                    "  Windows: install GPU vendor driver (NVIDIA/AMD/Intel)\n"
+                    "  Linux:   apt install vulkan-tools / mesa-vulkan-drivers\n");
+            if (gpu_only) {
+                fprintf(stderr, "GPU-only mode requested but no GPU is available.\n");
+                return 1;
+            }
         }
     }
 
@@ -1081,6 +1102,7 @@ int main(int argc, char *argv[])
 #endif
     if (instance != VK_NULL_HANDLE)
         vkDestroyInstance(instance, NULL);
+    vulkan_backend_shutdown();
 
     return 0;
 }
