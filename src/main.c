@@ -304,6 +304,21 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
                 if (pct >= 0)
                     info->fan_speed_pct = pct;
             }
+
+            /* memory: for iGPUs, use vram+gtt from sysfs (UMA total) */
+            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                uint64_t vr = 0, gt = 0;
+                if (sysfs_get_vram_total(s_idx, &vr) == 0 &&
+                    sysfs_get_gtt_total(s_idx, &gt) == 0) {
+                    uint64_t st = vr + gt;
+                    if (st > info->dedicated_vram_bytes) {
+                        uint64_t vt = info->dedicated_vram_bytes + info->shared_ram_bytes;
+                        if (st > vt) st = vt;
+                        info->dedicated_vram_bytes = st;
+                        info->shared_ram_bytes = vt - st;
+                    }
+                }
+            }
         }
 #endif
     }
@@ -525,6 +540,75 @@ static void gpu_print_json(const GpuInfo *gpus, int count)
     fputs("\n}\n", stdout);
 }
 
+static void gpu_json_write_memory_devices(const GpuInfo *gpus, int count)
+{
+    int i, j;
+    json_indent(1); fputs("\"devices\": [\n", stdout);
+
+    for (i = 0; i < count; i++) {
+        const GpuInfo *g = &gpus[i];
+
+        json_indent(2); fputs("{\n", stdout);
+
+        /* identification */
+        json_str_val(3, "name", g->device_name);        fputs(",\n", stdout);
+        json_str_val(3, "vendor", vendor_name(g->vendor_id)); fputs(",\n", stdout);
+        json_key(3, "vendor_id"); fprintf(stdout, "%u,\n", (unsigned)g->vendor_id);
+        json_key(3, "device_id"); fprintf(stdout, "%u,\n", (unsigned)g->device_id);
+        json_str_val(3, "type", device_type_str(g->device_type)); fputs(",\n", stdout);
+
+        /* memory */
+        json_indent(3); fputs("\"memory\": {\n", stdout);
+        json_key(4, "dedicated_vram_bytes");
+        fprintf(stdout, "%llu,\n", (unsigned long long)g->dedicated_vram_bytes);
+        json_key(4, "shared_ram_bytes");
+        fprintf(stdout, "%llu,\n", (unsigned long long)g->shared_ram_bytes);
+        json_indent(4); fputs("\"heaps\": [\n", stdout);
+        for (j = 0; j < (int)g->heap_count; j++) {
+            json_indent(5); fputs("{\n", stdout);
+            json_key(6, "size_bytes");
+            fprintf(stdout, "%llu,\n", (unsigned long long)g->heap_sizes[j]);
+            json_str_val(6, "flags",
+                (g->heap_flags[j] & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                ? "device_local" : "host");
+            fputc('\n', stdout);
+            json_indent(5); fputc('}', stdout);
+            if (j < (int)g->heap_count - 1) fputc(',', stdout);
+            fputc('\n', stdout);
+        }
+        json_indent(4); fputs("]\n", stdout);
+        json_indent(3); fputs("},\n", stdout);
+
+        /* sensors — only memory fields */
+        json_indent(3); fputs("\"sensors\": {\n", stdout);
+        if (g->sensor_backend[0]) {
+            json_str_val(4, "backend", g->sensor_backend); fputs(",\n", stdout);
+            json_key(4, "memory_used_bytes");
+            if (g->mem_total_bytes > 0)
+                fprintf(stdout, "%llu,\n", (unsigned long long)g->mem_used_bytes);
+            else
+                fputs("null,\n", stdout);
+            json_key(4, "memory_total_bytes");
+            if (g->mem_total_bytes > 0)
+                fprintf(stdout, "%llu\n", (unsigned long long)g->mem_total_bytes);
+            else
+                fputs("null\n", stdout);
+        } else {
+            json_str_val(4, "backend", ""); fputs(",\n", stdout);
+            json_key(4, "memory_used_bytes"); fputs("null,\n", stdout);
+            json_key(4, "memory_total_bytes"); fputs("null\n", stdout);
+        }
+        json_indent(3); fputs("}\n", stdout);
+
+        json_indent(2); fputc('}', stdout);
+        if (i < count - 1) fputc(',', stdout);
+        fputc('\n', stdout);
+    }
+
+    json_indent(1); fputs("],\n", stdout);
+    json_indent(1); fprintf(stdout, "\"device_count\": %d", count);
+}
+
 /* ================================================================
  *  System info text output
  * ================================================================ */
@@ -684,6 +768,22 @@ static void sys_print_json(const SysInfo *si)
     fputs("\n}\n", stdout);
 }
 
+static void sys_json_write_memory_only(const SysInfo *si)
+{
+    json_indent(1); fputs("\"system\": {\n", stdout);
+    json_indent(2); fputs("\"memory\": {\n", stdout);
+    json_key(3, "total_bytes");
+    fprintf(stdout, "%llu,\n", (unsigned long long)si->memory_total_bytes);
+    json_key(3, "used_bytes");
+    fprintf(stdout, "%llu,\n", (unsigned long long)si->memory_used_bytes);
+    json_key(3, "swap_total_bytes");
+    fprintf(stdout, "%llu,\n", (unsigned long long)si->swap_total_bytes);
+    json_key(3, "swap_used_bytes");
+    fprintf(stdout, "%llu\n", (unsigned long long)si->swap_used_bytes);
+    json_indent(2); fputs("}\n", stdout);
+    json_indent(1); fputc('}', stdout);
+}
+
 static void print_all_json(const SysInfo *si, const GpuInfo *gpus, int count)
 {
     fputs("{\n", stdout);
@@ -700,6 +800,17 @@ static void print_gpu_json(const GpuInfo *gpus, int count)
     fputs("\n}\n", stdout);
 }
 
+static void print_memory_json(const SysInfo *si, const GpuInfo *gpus, int count)
+{
+    fputs("{\n", stdout);
+    sys_json_write_memory_only(si);
+    if (count > 0) {
+        fputs(",\n", stdout);
+        gpu_json_write_memory_devices(gpus, count);
+    }
+    fputs("\n}\n", stdout);
+}
+
 /* ================================================================
  *  Core
  * ================================================================ */
@@ -708,12 +819,15 @@ int main(int argc, char *argv[])
 {
     int json_mode = 0;
     int gpu_only = 0;
+    int memory_only = 0;
     int argi;
     for (argi = 1; argi < argc; argi++) {
         if (strcmp(argv[argi], "--json") == 0) {
             json_mode = 1;
         } else if (strcmp(argv[argi], "--gpu") == 0) {
             gpu_only = 1;
+        } else if (strcmp(argv[argi], "--memory") == 0) {
+            memory_only = 1;
         }
     }
 
@@ -868,6 +982,29 @@ int main(int argc, char *argv[])
                     shared_ram += mem.memoryHeaps[h].size;
                 }
             }
+
+            /* sysfs memory: for AMD iGPUs, use vram+gtt from amdgpu */
+#ifdef __linux__
+            if (props.vendorID == 0x1002 &&
+                props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                int s_idx;
+                if (sysfs_find_by_vendor_device((int)props.vendorID,
+                                                (int)props.deviceID,
+                                                &s_idx) == 0) {
+                    uint64_t vr = 0, gt = 0;
+                    if (sysfs_get_vram_total(s_idx, &vr) == 0 &&
+                        sysfs_get_gtt_total(s_idx, &gt) == 0) {
+                        uint64_t st = vr + gt;
+                        if (st > dedicated_vram) {
+                            uint64_t vt = dedicated_vram + shared_ram;
+                            if (st > vt) st = vt;
+                            dedicated_vram = st;
+                            shared_ram = vt - st;
+                        }
+                    }
+                }
+            }
+#endif
 
             char vram_buf[64], sram_buf[64];
             char api_buf[32], driver_buf[64];
@@ -1074,7 +1211,14 @@ int main(int argc, char *argv[])
     }
 
     /* -- system info output -- */
-    if (!gpu_only) {
+    if (memory_only) {
+        if (json_mode) {
+            if (instance != VK_NULL_HANDLE)
+                print_memory_json(&si, gpus, (int)device_count);
+            else
+                print_memory_json(&si, NULL, 0);
+        }
+    } else if (!gpu_only) {
         if (json_mode) {
             if (instance != VK_NULL_HANDLE)
                 print_all_json(&si, gpus, (int)device_count);

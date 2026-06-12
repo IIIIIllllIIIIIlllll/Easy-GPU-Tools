@@ -1,6 +1,8 @@
 #ifndef BACKEND_SYSFS_H
 #define BACKEND_SYSFS_H
 
+#include <stdint.h>
+
 /* ================================================================
  *  backend_sysfs  --  Linux sysfs GPU dynamic info
  *
@@ -43,6 +45,10 @@ int sysfs_get_power(int idx, int *milliwatts);
 /* Fan speed: RPM and percent. 0 on success. */
 int sysfs_get_fan(int idx, int *rpm, int *percent);
 
+/* Total VRAM / GTT memory (bytes) from mem_info_vram_total / mem_info_gtt_total. */
+int sysfs_get_vram_total(int idx, uint64_t *bytes);
+int sysfs_get_gtt_total(int idx, uint64_t *bytes);
+
 #else  /* Windows / macOS -- everything is a no-op */
 
 static inline int  sysfs_init(void) { return -1; }
@@ -59,6 +65,10 @@ static inline int  sysfs_get_power(int i, int *m)
     { (void)i; (void)m; return -1; }
 static inline int  sysfs_get_fan(int i, int *r, int *p)
     { (void)i; (void)r; (void)p; return -1; }
+static inline int  sysfs_get_vram_total(int i, uint64_t *b)
+    { (void)i; (void)b; return -1; }
+static inline int  sysfs_get_gtt_total(int i, uint64_t *b)
+    { (void)i; (void)b; return -1; }
 
 #endif /* __linux__ */
 
