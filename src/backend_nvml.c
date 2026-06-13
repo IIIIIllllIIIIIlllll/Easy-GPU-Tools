@@ -71,7 +71,6 @@ typedef struct {
 } nvmlUtilization_t;
 
 typedef struct {
-    unsigned int version;
     unsigned long long total;   /* bytes */
     unsigned long long free;
     unsigned long long used;
@@ -401,7 +400,6 @@ int nvml_get_memory(int idx, unsigned int *used_mb, unsigned int *total_mb)
     nvmlMemory_t m = {0};
     CHECK(idx);
     if (!pfn_GetMem) return -1;
-    m.version = sizeof(m);
     if (pfn_GetMem(g_devices[idx], &m) != NVML_SUCCESS) return -1;
     *used_mb  = (unsigned int)(m.used  / (1024ULL * 1024ULL));
     *total_mb = (unsigned int)(m.total / (1024ULL * 1024ULL));
