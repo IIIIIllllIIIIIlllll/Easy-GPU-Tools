@@ -49,6 +49,9 @@ int sysfs_get_fan(int idx, int *rpm, int *percent);
 int sysfs_get_vram_total(int idx, uint64_t *bytes);
 int sysfs_get_gtt_total(int idx, uint64_t *bytes);
 
+/* Used and total VRAM in bytes from mem_info_vram_used / mem_info_vram_total. */
+int sysfs_get_memory(int idx, uint64_t *used_bytes, uint64_t *total_bytes);
+
 #else  /* Windows / macOS -- everything is a no-op */
 
 static inline int  sysfs_init(void) { return -1; }
@@ -69,6 +72,8 @@ static inline int  sysfs_get_vram_total(int i, uint64_t *b)
     { (void)i; (void)b; return -1; }
 static inline int  sysfs_get_gtt_total(int i, uint64_t *b)
     { (void)i; (void)b; return -1; }
+static inline int  sysfs_get_memory(int i, uint64_t *used, uint64_t *total)
+    { (void)i; (void)used; (void)total; return -1; }
 
 #endif /* __linux__ */
 

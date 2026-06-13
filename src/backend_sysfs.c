@@ -310,4 +310,19 @@ int sysfs_get_gtt_total(int idx, uint64_t *bytes)
     return 0;
 }
 
+int sysfs_get_memory(int idx, uint64_t *used_bytes, uint64_t *total_bytes)
+{
+    char p[PATH_MAX + 64];
+    unsigned long long val;
+    if (idx < 0 || idx >= g_num_gpus || !g_gpus[idx].valid)
+        return -1;
+    make_path(p, sizeof(p), g_gpus[idx].dev_path, "mem_info_vram_total");
+    if (read_ull(p, &val) != 0) return -1;
+    *total_bytes = (uint64_t)val;
+    make_path(p, sizeof(p), g_gpus[idx].dev_path, "mem_info_vram_used");
+    if (read_ull(p, &val) != 0) return -1;
+    *used_bytes = (uint64_t)val;
+    return 0;
+}
+
 #endif /* __linux__ */

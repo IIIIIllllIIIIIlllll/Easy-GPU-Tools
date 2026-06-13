@@ -305,6 +305,12 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
                     info->fan_speed_pct = pct;
             }
 
+            uint64_t vram_used_b, vram_total_b;
+            if (sysfs_get_memory(s_idx, &vram_used_b, &vram_total_b) == 0) {
+                info->mem_used_bytes  = vram_used_b;
+                info->mem_total_bytes = vram_total_b;
+            }
+
             /* memory: for iGPUs, use vram+gtt from sysfs (UMA total) */
             if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
                 uint64_t vr = 0, gt = 0;
@@ -1113,6 +1119,16 @@ int main(int argc, char *argv[])
                         printf("  Power           : %.2f W\n", power / 1000.0);
                     else
                         printf("  Power           : N/A\n");
+
+                    {
+                        uint64_t vram_used_b, vram_total_b;
+                        if (sysfs_get_memory(s_idx, &vram_used_b, &vram_total_b) == 0)
+                            printf("  Memory Usage    : %llu / %llu MB\n",
+                                   (unsigned long long)(vram_used_b / (1024ULL * 1024ULL)),
+                                   (unsigned long long)(vram_total_b / (1024ULL * 1024ULL)));
+                        else
+                            printf("  Memory Usage    : N/A\n");
+                    }
                 } else {
                     printf("  (could not match /sys/class/drm/ device)\n");
                 }
