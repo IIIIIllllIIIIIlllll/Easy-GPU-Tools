@@ -48,6 +48,11 @@ int adl_get_activity(int adapter_index,
  * Returns 0 on success, -1 on failure. */
 int adl_get_speed(int adapter_index, int *core_mhz, int *mem_mhz);
 
+/* ADL_Adapter_MemoryInfo_Get + ADL2_Adapter_VramUsage_Get.
+ * Returns used and total VRAM in bytes. 0 on success, -1 on failure. */
+int adl_get_memory(int adapter_index, uint64_t *used_bytes,
+                   uint64_t *total_bytes);
+
 #else  /* Linux / non-Windows stubs */
 
 static inline int adl_init(void)           { return -1; }
@@ -64,6 +69,8 @@ static inline int adl_get_activity(int idx, int *e, int *m, int *a, int *l)
     { (void)idx; (void)e; (void)m; (void)a; (void)l; return -1; }
 static inline int adl_get_speed(int idx, int *c, int *m)
     { (void)idx; (void)c; (void)m; return -1; }
+static inline int adl_get_memory(int idx, uint64_t *u, uint64_t *t)
+    { (void)idx; (void)u; (void)t; return -1; }
 
 #endif /* _WIN32 */
 

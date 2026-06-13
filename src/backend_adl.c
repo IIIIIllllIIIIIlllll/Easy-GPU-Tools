@@ -32,12 +32,12 @@ typedef struct {
     int  iSize;                   /*   0 */
     int  iAdapterIndex;           /*   4 */
     char strUDID[256];            /*   8 */
-    int  iPresent;                /* 264 */
-    int  iExist;                  /* 268 */
-    int  iVendorID;               /* 272 */
-    int  iDeviceID;               /* 276 */
+    int  iBusNumber;              /* 264 */
+    int  iDeviceNumber;           /* 268 */
+    int  iFunctionNumber;         /* 272 */
+    int  iVendorID;               /* 276 */
     char strAdapterName[256];     /* 280 */
-    char _pad[1488];
+    char _pad[1488];              /* fields after name vary between ADL versions */
 } ADLAdapterInfo;
 
 /* Overdrive5 (legacy) */
@@ -71,6 +71,14 @@ typedef struct { int iSize; int iFanSpeedPercent; int iFanSpeedRPM;
 typedef struct { int iSize; int iCoreClock; int iMemoryClock;
                  int _pad[32]; } ADLAdapterSpeed;
 
+/* MemoryInfo -- from ADL_Adapter_MemoryInfo_Get (total VRAM) */
+typedef struct {
+    int       iSize;
+    long long iMemorySize;      /* total VRAM bytes */
+    char      strMemoryType[256];
+    int       iMemoryBandwidth;
+} ADLMemoryInfo;
+
 /* ------------------------------------------------------------------
  *  Function pointer typedefs
  * ------------------------------------------------------------------ */
@@ -91,6 +99,9 @@ typedef int (*PFN_ODN_PERF)  (int, ADLODNPerfStatus*);
 typedef int (*PFN_ODN_FAN)   (int, ADLODNFan*);
 
 typedef int (*PFN_ADAPTER_SPEED)(int, ADLAdapterSpeed*);
+
+typedef int (*PFN_MEMORY_INFO)(int, ADLMemoryInfo*);
+typedef int (*PFN_VRAM_USAGE)(int, long long*);
 
 /* ------------------------------------------------------------------
  *  Static state
@@ -117,6 +128,9 @@ typedef int (*PFN_OD6_TEMP)(int, int*);
 static PFN_OD6_TEMP     pfn_OD6_Temp     = NULL;
 
 static PFN_ADAPTER_SPEED pfn_AdapterSpeed = NULL;
+
+static PFN_MEMORY_INFO  pfn_MemoryInfo  = NULL;
+static PFN_VRAM_USAGE   pfn_VramUsage   = NULL;
 
 static int              g_num_adapters  = 0;
 static ADLAdapterInfo  *g_adapters      = NULL;
@@ -184,6 +198,11 @@ int adl_init(void)
 
     /* Adapter Speed (clock frequencies) -- works even on APUs */
     GET(pfn_AdapterSpeed, "ADL2_Adapter_Speed_Get");
+
+    /* memory info / vram usage */
+    GET(pfn_MemoryInfo, "ADL_Adapter_MemoryInfo_Get");
+    GET(pfn_VramUsage,  "ADL2_Adapter_VramUsage_Get");
+    if (!pfn_VramUsage) GET(pfn_VramUsage, "ADL2_Adapter_CurrentVramUsage_Get");
 
     /* create ADL context */
     r = pfn_Create(adl_malloc, 1);
@@ -260,9 +279,9 @@ int adl_find_by_pci(uint32_t vendor_id, uint32_t device_id, int *adl_index)
 {
     int i;
     if (g_init_ok <= 0 || !g_adapters) return -1;
+    (void)device_id;
     for (i = 0; i < g_num_adapters; i++) {
-        if ((uint32_t)g_adapters[i].iVendorID  == vendor_id &&
-            (uint32_t)g_adapters[i].iDeviceID  == device_id) {
+        if ((uint32_t)g_adapters[i].iVendorID == vendor_id) {
             *adl_index = i;
             return 0;
         }
@@ -379,6 +398,36 @@ int adl_get_speed(int idx, int *core_mhz, int *mem_mhz)
             *mem_mhz  = s.iMemoryClock;
             return 0;
         }
+    }
+    return -1;
+}
+
+int adl_get_memory(int idx, uint64_t *used_bytes, uint64_t *total_bytes)
+{
+    int ok = 0;
+
+    /* total VRAM from ADL_Adapter_MemoryInfo_Get */
+    if (pfn_MemoryInfo) {
+        ADLMemoryInfo mi; memset(&mi, 0, sizeof(mi)); mi.iSize = sizeof(mi);
+        if (pfn_MemoryInfo(idx, &mi) == ADL_OK && mi.iMemorySize > 0) {
+            *total_bytes = (uint64_t)mi.iMemorySize;
+            ok = 1;
+        }
+    }
+
+    /* used VRAM from ADL2_Adapter_VramUsage_Get */
+    if (pfn_VramUsage) {
+        long long usage = 0;
+        int r = pfn_VramUsage(idx, &usage);
+        if (r == ADL_OK && usage >= 0) {
+            *used_bytes = (uint64_t)usage;
+            return 0;
+        }
+    }
+
+    if (ok) {
+        *used_bytes = 0; /* total is known but used is not available */
+        return 0;
     }
     return -1;
 }

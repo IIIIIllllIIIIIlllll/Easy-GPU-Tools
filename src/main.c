@@ -246,7 +246,8 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
     else if (props.vendorID == 0x1002) {
 #if defined(_WIN32)
         int adl_idx;
-        if (adl_find_by_pci(props.vendorID, props.deviceID, &adl_idx) == 0) {
+        if (adl_find_by_pci(props.vendorID, props.deviceID, &adl_idx) == 0 ||
+            adl_find_by_name(props.deviceName, &adl_idx) == 0) {
             strncpy(info->sensor_backend, "ADL", sizeof(info->sensor_backend) - 1);
 
             int t;
@@ -271,6 +272,12 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
                     info->core_clock_mhz = core_mhz;
                     info->mem_clock_mhz  = mm_mhz;
                 }
+            }
+
+            uint64_t vram_used, vram_total;
+            if (adl_get_memory(adl_idx, &vram_used, &vram_total) == 0) {
+                info->mem_used_bytes  = vram_used;
+                info->mem_total_bytes = vram_total;
             }
         }
 #elif defined(__linux__)
@@ -1078,6 +1085,16 @@ int main(int argc, char *argv[])
                             printf("  Memory Clock    : N/A\n");
                         }
                         printf("  Perf Level      : N/A\n");
+                    }
+
+                    {
+                        uint64_t vram_used, vram_total;
+                        if (adl_get_memory(adl_idx, &vram_used, &vram_total) == 0)
+                            printf("  Memory Usage    : %llu / %llu MB\n",
+                                   (unsigned long long)(vram_used / (1024ULL * 1024ULL)),
+                                   (unsigned long long)(vram_total / (1024ULL * 1024ULL)));
+                        else
+                            printf("  Memory Usage    : N/A\n");
                     }
                 } else {
                     printf("  (could not match ADL adapter)\n");
