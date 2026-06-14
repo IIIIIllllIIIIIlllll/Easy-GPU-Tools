@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [master]
+    tags: ['v*']
   workflow_dispatch:
 
 jobs:
@@ -11,11 +12,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: gpu-info-linux
-            binary: build/gpu-info
+            artifact: gpu-info-x64-linux
+            binary: build/gpu-info-x64
           - os: windows-latest
-            artifact: gpu-info-windows-x64
-            binary: build/Release/gpu-info.exe
+            artifact: gpu-info-x64-windows
+            binary: build/Release/gpu-info-x64.exe
 
     runs-on: ${{ matrix.os }}
 
@@ -47,8 +48,24 @@ jobs:
     - name: Build
       run: cmake --build build --config Release
 
+    - name: Rename & chmod
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          mv build/gpu-info build/gpu-info-x64
+          chmod +x build/gpu-info-x64
+        elif [[ "$RUNNER_OS" == "Windows" ]]; then
+          mv build/Release/gpu-info.exe build/Release/gpu-info-x64.exe
+        fi
+
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact }}
         path: ${{ matrix.binary }}
+
+    - name: Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ${{ matrix.binary }}

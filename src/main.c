@@ -329,6 +329,11 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
                         if (st > vt) st = vt;
                         info->dedicated_vram_bytes = st;
                         info->shared_ram_bytes = vt - st;
+
+                        uint64_t gu = 0;
+                        if (sysfs_get_gtt_used(s_idx, &gu) == 0)
+                            info->mem_used_bytes += gu;
+                        info->mem_total_bytes = st;
                     }
                 }
             }
@@ -1139,11 +1144,28 @@ int main(int argc, char *argv[])
 
                     {
                         uint64_t vram_used_b, vram_total_b;
-                        if (sysfs_get_memory(s_idx, &vram_used_b, &vram_total_b) == 0)
+                        if (sysfs_get_memory(s_idx, &vram_used_b, &vram_total_b) == 0) {
+                            uint64_t display_used  = vram_used_b;
+                            uint64_t display_total = vram_total_b;
+                            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                                uint64_t vr = 0, gt = 0;
+                                if (sysfs_get_vram_total(s_idx, &vr) == 0 &&
+                                    sysfs_get_gtt_total(s_idx, &gt) == 0) {
+                                    uint64_t st = vr + gt;
+                                    if (st > vram_total_b) {
+                                        uint64_t vt = dedicated_vram + shared_ram;
+                                        if (st > vt) st = vt;
+                                        display_total = st;
+                                        uint64_t gu = 0;
+                                        if (sysfs_get_gtt_used(s_idx, &gu) == 0)
+                                            display_used += gu;
+                                    }
+                                }
+                            }
                             printf("  Memory Usage    : %llu / %llu MB\n",
-                                   (unsigned long long)(vram_used_b / (1024ULL * 1024ULL)),
-                                   (unsigned long long)(vram_total_b / (1024ULL * 1024ULL)));
-                        else
+                                   (unsigned long long)(display_used / (1024ULL * 1024ULL)),
+                                   (unsigned long long)(display_total / (1024ULL * 1024ULL)));
+                        } else
                             printf("  Memory Usage    : N/A\n");
                     }
                 } else {
