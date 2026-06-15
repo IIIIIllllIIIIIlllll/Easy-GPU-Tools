@@ -267,17 +267,22 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
                 info->mem_clock_mhz       = mem_clk / 100;
                 info->perf_state          = lvl;
             } else {
-                int core_mhz, mm_mhz;
-                if (adl_get_speed(adl_idx, &core_mhz, &mm_mhz) == 0) {
-                    info->core_clock_mhz = core_mhz;
-                    info->mem_clock_mhz  = mm_mhz;
-                }
+                /* clocks remain unavailable when OverdriveN/OD5 fail */
+                (void)adl_idx;
             }
 
             uint64_t vram_used, vram_total;
             if (adl_get_memory(adl_idx, &vram_used, &vram_total) == 0) {
                 info->mem_used_bytes  = vram_used;
                 info->mem_total_bytes = vram_total;
+            }
+
+            /* memory: for AMD iGPUs ADL only reports the small
+             * hardware-reserved segment; use the Vulkan-visible total. */
+            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                uint64_t vt = info->dedicated_vram_bytes + info->shared_ram_bytes;
+                if (vt > info->mem_total_bytes)
+                    info->mem_total_bytes = vt;
             }
         }
 #elif defined(__linux__)
@@ -1063,7 +1068,6 @@ int main(int argc, char *argv[])
                 printf("\n  --- AMD Dynamic Info (ADL) ---\n");
                 if (adl_find_by_name(props.deviceName, &adl_idx) == 0) {
                     int t, rpm, pct, eng, mem_clk, act, lvl;
-                    int core_mhz, mem_mhz;
 
                     if (adl_get_temperature(adl_idx, &t) == 0)
                         printf("  GPU Temperature : %.1f C\n", t / 1000.0);
@@ -1082,23 +1086,23 @@ int main(int argc, char *argv[])
                         printf("  Perf Level      : P%d\n", lvl);
                     } else {
                         printf("  GPU Utilization : N/A\n");
-                        if (adl_get_speed(adl_idx, &core_mhz, &mem_mhz) == 0) {
-                            printf("  Engine Clock    : %d MHz\n", core_mhz);
-                            printf("  Memory Clock    : %d MHz\n", mem_mhz);
-                        } else {
-                            printf("  Engine Clock    : N/A\n");
-                            printf("  Memory Clock    : N/A\n");
-                        }
+                        printf("  Engine Clock    : N/A\n");
+                        printf("  Memory Clock    : N/A\n");
                         printf("  Perf Level      : N/A\n");
                     }
 
                     {
                         uint64_t vram_used, vram_total;
-                        if (adl_get_memory(adl_idx, &vram_used, &vram_total) == 0)
+                        if (adl_get_memory(adl_idx, &vram_used, &vram_total) == 0) {
+                            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                                uint64_t vt = dedicated_vram + shared_ram;
+                                if (vt > vram_total)
+                                    vram_total = vt;
+                            }
                             printf("  Memory Usage    : %llu / %llu MB\n",
                                    (unsigned long long)(vram_used / (1024ULL * 1024ULL)),
                                    (unsigned long long)(vram_total / (1024ULL * 1024ULL)));
-                        else
+                        } else
                             printf("  Memory Usage    : N/A\n");
                     }
                 } else {

@@ -22,7 +22,7 @@ int adl_find_by_name(const char *name, int *adl_index);
  * Returns 0 and sets *adl_index on success, -1 if not found. */
 int adl_find_by_pci(uint32_t vendor_id, uint32_t device_id, int *adl_index);
 
-/* ADL_Overdrive5_Temperature_Get.
+/* ADL2_OverdriveN_Temperature_Get / ADL_Overdrive5_Temperature_Get.
  * Returns temperature in millidegrees Celsius. 0 on success, -1 on failure. */
 int adl_get_temperature(int adapter_index, int *temp_milli_c);
 
@@ -30,7 +30,7 @@ int adl_get_temperature(int adapter_index, int *temp_milli_c);
  * Returns fan RPM and percentage. 0 on success, -1 on failure. */
 int adl_get_fan_speed(int adapter_index, int *rpm, int *percent);
 
-/* ADL_Overdrive5_CurrentActivity_Get.
+/* ADL2_OverdriveN_PerformanceStatus_Get / ADL_Overdrive5_CurrentActivity_Get.
  * engine_clock:    in 10 kHz (divide by 100 -> MHz)
  * memory_clock:    in 10 kHz (divide by 100 -> MHz)
  * activity_percent: GPU utilization (0-100)
@@ -42,13 +42,7 @@ int adl_get_activity(int adapter_index,
                      int *activity_percent,
                      int *perf_level);
 
-/* ADL2_Adapter_Speed_Get.
- * Returns core clock (MHz) and memory clock (MHz).
- * Works even on APU integrated graphics.
- * Returns 0 on success, -1 on failure. */
-int adl_get_speed(int adapter_index, int *core_mhz, int *mem_mhz);
-
-/* ADL_Adapter_MemoryInfo_Get + ADL2_Adapter_VramUsage_Get.
+/* ADL_Adapter_MemoryInfo_Get + ADL2_Adapter_VRAMUsage_Get.
  * Returns used and total VRAM in bytes. 0 on success, -1 on failure. */
 int adl_get_memory(int adapter_index, uint64_t *used_bytes,
                    uint64_t *total_bytes);
@@ -67,8 +61,6 @@ static inline int adl_get_fan_speed(int idx, int *r, int *p)
     { (void)idx; (void)r; (void)p; return -1; }
 static inline int adl_get_activity(int idx, int *e, int *m, int *a, int *l)
     { (void)idx; (void)e; (void)m; (void)a; (void)l; return -1; }
-static inline int adl_get_speed(int idx, int *c, int *m)
-    { (void)idx; (void)c; (void)m; return -1; }
 static inline int adl_get_memory(int idx, uint64_t *u, uint64_t *t)
     { (void)idx; (void)u; (void)t; return -1; }
 

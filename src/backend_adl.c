@@ -4,8 +4,9 @@
  *  Loads ADL at runtime via LoadLibrary.  If the DLL is not present
  *  (e.g. no AMD driver installed) the whole backend degrades gracefully.
  *
- *  Queries dynamic GPU info using OverdriveN (modern) with automatic
- *  fallback to Overdrive5 (legacy).
+ *  Uses ADL2 where the modern driver exposes it (memory usage,
+ *  OverdriveN) and falls back to legacy ADL / Overdrive5 / Overdrive6
+ *  for older drivers.
  * ================================================================ */
 
 #ifdef _WIN32
@@ -20,14 +21,17 @@
 #include "backend_adl.h"
 
 /* ------------------------------------------------------------------
- *  Internal structures
+ *  Internal structures -- matched to the official ADL SDK headers.
+ *  Several structures in the original code had an incorrect leading
+ *  iSize or wrong field order; those have been fixed below.
  * ------------------------------------------------------------------ */
 
 #define ADL_OK                    0
 
-typedef void* (*ADL_MALLOC_CB)(int);
+typedef void *ADL_CONTEXT_HANDLE;
+typedef void* (__stdcall *ADL_MALLOC_CB)(int);
 
-/* AdapterInfo -- layout from AMD Adrenalin 32.x+ (strAdapterName at 280) */
+/* AdapterInfo -- layout from AMD ADL SDK (fields after name are ignored) */
 typedef struct {
     int  iSize;                   /*   0 */
     int  iAdapterIndex;           /*   4 */
@@ -37,7 +41,7 @@ typedef struct {
     int  iFunctionNumber;         /* 272 */
     int  iVendorID;               /* 276 */
     char strAdapterName[256];     /* 280 */
-    char _pad[1488];              /* fields after name vary between ADL versions */
+    char _pad[1488];              /* fields after name vary by driver */
 } ADLAdapterInfo;
 
 /* Overdrive5 (legacy) */
@@ -48,60 +52,79 @@ typedef struct { int iSize; int iEngineClock; int iMemoryClock;
                  int iCurrentPerformanceLevel;
                  int iCurrentBusSpeed; int iCurrentBusLanes; } ADLOD5Activity;
 
-/* OverdriveN (modern) -- generous padding to survive struct growth */
-
-/* ADLODNTemperature: used by ADL2_OverdriveN_Temperature_Get.
- * iTemperatureType[0] = input (which sensor, e.g. 1=Edge)
- * iTemperatureValue[0] = output (millidegrees C) */
+/* OverdriveN performance status -- no iSize, official field order */
 typedef struct {
-    int iSize;
-    int iTemperatureType[8];
-    int iTemperatureValue[8];
-    int iTemperatureFlags[8];
-} ADLODNTemp;
+    int iCoreClock;
+    int iCurrentBusLanes;
+    int iCurrentBusSpeed;
+    int iCurrentCorePerformanceLevel;
+    int iCurrentDCEFPerformanceLevel;
+    int iCurrentGFXPerformanceLevel;
+    int iCurrentMemoryPerformanceLevel;
+    int iDCEFClock;
+    int iGFXClock;
+    int iGPUActivityPercent;
+    int iMaximumBusLanes;
+    int iMemoryClock;
+    int iUVDClock;
+    int iUVDPerformanceLevel;
+    int iVCEClock;
+    int iVCEPerformanceLevel;
+    int iVDDC;
+    int iVDDCI;
+    int _pad[64];
+} ADLODNPerfStatus;
 
-typedef struct { int iSize; int iCoreClock; int iMemoryClock;
-                 int iGPUActivityPercent; int iCurrentCorePerformanceLevel;
-                 int _pad[64]; } ADLODNPerfStatus;
-
-typedef struct { int iSize; int iFanSpeedPercent; int iFanSpeedRPM;
-                 int _pad[32]; } ADLODNFan;
-
-/* AdapterSpeed -- from ADL2_Adapter_Speed_Get (works on APUs) */
-typedef struct { int iSize; int iCoreClock; int iMemoryClock;
-                 int _pad[32]; } ADLAdapterSpeed;
-
-/* MemoryInfo -- from ADL_Adapter_MemoryInfo_Get (total VRAM) */
+/* ADLMemoryInfo -- no iSize, official field order (iMemorySize first) */
 typedef struct {
-    int       iSize;
-    long long iMemorySize;      /* total VRAM bytes */
+    long long iMemorySize;        /* total VRAM bytes */
     char      strMemoryType[256];
-    int       iMemoryBandwidth;
+    long long iMemoryBandwidth;
 } ADLMemoryInfo;
 
+/* ADLMemoryInfo2 -- used as a fallback for total memory on some APUs */
+typedef struct {
+    long long iMemorySize;
+    char      strMemoryType[256];
+    long long iMemoryBandwidth;
+    long long iHyperMemorySize;
+    long long iInvisibleMemorySize;
+    long long iVisibleMemorySize;
+} ADLMemoryInfo2;
+
 /* ------------------------------------------------------------------
- *  Function pointer typedefs
+ *  Function pointer typedefs (__stdcall matches the DLL exports)
  * ------------------------------------------------------------------ */
 
-typedef int (*PFN_CREATE) (ADL_MALLOC_CB, int);
-typedef int (*PFN_DESTROY)(void);
-typedef int (*PFN_NUMADAPTERS)(int*);
-typedef int (*PFN_ADAPTERINFO)(ADLAdapterInfo*, int);
+typedef int (__stdcall *PFN_CREATE) (ADL_MALLOC_CB, int);
+typedef int (__stdcall *PFN_DESTROY)(void);
+typedef int (__stdcall *PFN_NUMADAPTERS)(int*);
+typedef int (__stdcall *PFN_ADAPTERINFO)(ADLAdapterInfo*, int);
 
-/* Overdrive5 */
-typedef int (*PFN_OD5_TEMP)  (int, int, ADLOD5Temp*);
-typedef int (*PFN_OD5_FAN)   (int, int, ADLOD5Fan*);
-typedef int (*PFN_OD5_ACT)   (int, ADLOD5Activity*);
+/* ADL2 control */
+typedef int (__stdcall *PFN_CREATE2) (ADL_MALLOC_CB, int, ADL_CONTEXT_HANDLE*);
+typedef int (__stdcall *PFN_DESTROY2)(ADL_CONTEXT_HANDLE);
 
-/* OverdriveN */
-typedef int (*PFN_ODN_TEMP)  (int, ADLODNTemp*);
-typedef int (*PFN_ODN_PERF)  (int, ADLODNPerfStatus*);
-typedef int (*PFN_ODN_FAN)   (int, ADLODNFan*);
+/* Overdrive5 (legacy, global context) */
+typedef int (__stdcall *PFN_OD5_TEMP)  (int, int, ADLOD5Temp*);
+typedef int (__stdcall *PFN_OD5_FAN)   (int, int, ADLOD5Fan*);
+typedef int (__stdcall *PFN_OD5_ACT)   (int, ADLOD5Activity*);
 
-typedef int (*PFN_ADAPTER_SPEED)(int, ADLAdapterSpeed*);
+/* OverdriveN (ADL2 only) */
+typedef int (__stdcall *PFN_ODN_TEMP2) (ADL_CONTEXT_HANDLE, int, int, int*);
+typedef int (__stdcall *PFN_ODN_PERF2) (ADL_CONTEXT_HANDLE, int, ADLODNPerfStatus*);
 
-typedef int (*PFN_MEMORY_INFO)(int, ADLMemoryInfo*);
-typedef int (*PFN_VRAM_USAGE)(int, long long*);
+/* Overdrive6 (also has a plain ADL variant) */
+typedef int (__stdcall *PFN_OD6_TEMP)  (int, int*);
+
+/* memory */
+typedef int (__stdcall *PFN_MEMORY_INFO)  (int, ADLMemoryInfo*);
+typedef int (__stdcall *PFN_MEMORY_INFO2) (int, ADLMemoryInfo2*);
+
+/* ADL2 memory usage -- returned value is in megabytes */
+typedef int (__stdcall *PFN_VRAM_USAGE2)          (ADL_CONTEXT_HANDLE, int, int*);
+typedef int (__stdcall *PFN_DEDICATED_VRAM_USAGE2)(ADL_CONTEXT_HANDLE, int, int*);
+typedef int (__stdcall *PFN_SHARED_VRAM_USAGE2)   (ADL_CONTEXT_HANDLE, int, int*);
 
 /* ------------------------------------------------------------------
  *  Static state
@@ -110,8 +133,12 @@ typedef int (*PFN_VRAM_USAGE)(int, long long*);
 static HMODULE g_hDll     = NULL;
 static int     g_init_ok  = 0;
 
+static ADL_CONTEXT_HANDLE g_adl2_ctx = NULL;
+
 static PFN_CREATE       pfn_Create      = NULL;
 static PFN_DESTROY      pfn_Destroy     = NULL;
+static PFN_CREATE2      pfn_Create2     = NULL;
+static PFN_DESTROY2     pfn_Destroy2    = NULL;
 static PFN_NUMADAPTERS  pfn_NumAdapters = NULL;
 static PFN_ADAPTERINFO  pfn_AdapterInfo = NULL;
 
@@ -119,18 +146,17 @@ static PFN_OD5_TEMP     pfn_OD5_Temp    = NULL;
 static PFN_OD5_FAN      pfn_OD5_Fan     = NULL;
 static PFN_OD5_ACT      pfn_OD5_Act     = NULL;
 
-static PFN_ODN_TEMP     pfn_ODN_Temp    = NULL;
-static PFN_ODN_PERF     pfn_ODN_Perf    = NULL;
-static PFN_ODN_FAN      pfn_ODN_Fan     = NULL;
+static PFN_ODN_TEMP2    pfn_ODN_Temp2   = NULL;
+static PFN_ODN_PERF2    pfn_ODN_Perf2   = NULL;
 
-/* Overdrive6 has a different signature: int func(int idx, int *out) */
-typedef int (*PFN_OD6_TEMP)(int, int*);
-static PFN_OD6_TEMP     pfn_OD6_Temp     = NULL;
-
-static PFN_ADAPTER_SPEED pfn_AdapterSpeed = NULL;
+static PFN_OD6_TEMP     pfn_OD6_Temp    = NULL;
 
 static PFN_MEMORY_INFO  pfn_MemoryInfo  = NULL;
-static PFN_VRAM_USAGE   pfn_VramUsage   = NULL;
+static PFN_MEMORY_INFO2 pfn_MemoryInfo2 = NULL;
+
+static PFN_VRAM_USAGE2           pfn_VramUsage2           = NULL;
+static PFN_DEDICATED_VRAM_USAGE2 pfn_DedicatedVramUsage2  = NULL;
+static PFN_SHARED_VRAM_USAGE2    pfn_SharedVramUsage2     = NULL;
 
 static int              g_num_adapters  = 0;
 static ADLAdapterInfo  *g_adapters      = NULL;
@@ -139,7 +165,7 @@ static ADLAdapterInfo  *g_adapters      = NULL;
  *  Helpers
  * ------------------------------------------------------------------ */
 
-static void* adl_malloc(int size) { return malloc((size_t)size); }
+static void* __stdcall adl_malloc(int size) { return malloc((size_t)size); }
 
 #define GET(ptr, name) \
     (ptr) = (void*)GetProcAddress(g_hDll, name)
@@ -178,40 +204,58 @@ int adl_init(void)
     if (!g_hDll) g_hDll = LoadLibraryA("atiadlxy.dll");
     if (!g_hDll) { g_init_ok = -1; return -1; }
 
+    /* global control */
     REQUIRED(pfn_Create,      "ADL_Main_Control_Create");
     REQUIRED(pfn_Destroy,     "ADL_Main_Control_Destroy");
     REQUIRED(pfn_NumAdapters, "ADL_Adapter_NumberOfAdapters_Get");
     REQUIRED(pfn_AdapterInfo, "ADL_Adapter_AdapterInfo_Get");
 
-    /* optional: Overdrive5 (may not exist on very old drivers) */
+    /* ADL2 control (optional but strongly preferred) */
+    GET(pfn_Create2,  "ADL2_Main_Control_Create");
+    GET(pfn_Destroy2, "ADL2_Main_Control_Destroy");
+
+    /* Overdrive5 (legacy) */
     GET(pfn_OD5_Temp, "ADL_Overdrive5_Temperature_Get");
     GET(pfn_OD5_Fan,  "ADL_Overdrive5_FanSpeed_Get");
     GET(pfn_OD5_Act,  "ADL_Overdrive5_CurrentActivity_Get");
 
-    /* optional: OverdriveN (present on Adrenalin 2019+) */
-    GET(pfn_ODN_Temp, "ADL2_OverdriveN_Temperature_Get");
-    GET(pfn_ODN_Perf, "ADL2_OverdriveN_PerformanceStatus_Get");
-    GET(pfn_ODN_Fan,  "ADL2_OverdriveN_FanControl_Get");
+    /* OverdriveN (modern, ADL2 only) */
+    GET(pfn_ODN_Temp2, "ADL2_OverdriveN_Temperature_Get");
+    GET(pfn_ODN_Perf2, "ADL2_OverdriveN_PerformanceStatus_Get");
 
-    /* also try Overdrive6 (some APU integrated graphics use this) */
-    GET(pfn_OD6_Temp, "ADL2_Overdrive6_Temperature_Get");
+    /* Overdrive6 (has a plain ADL variant) */
+    GET(pfn_OD6_Temp, "ADL_Overdrive6_Temperature_Get");
 
-    /* Adapter Speed (clock frequencies) -- works even on APUs */
-    GET(pfn_AdapterSpeed, "ADL2_Adapter_Speed_Get");
+    /* memory information */
+    GET(pfn_MemoryInfo,  "ADL_Adapter_MemoryInfo_Get");
+    GET(pfn_MemoryInfo2, "ADL_Adapter_MemoryInfo2_Get");
 
-    /* memory info / vram usage */
-    GET(pfn_MemoryInfo, "ADL_Adapter_MemoryInfo_Get");
-    GET(pfn_VramUsage,  "ADL2_Adapter_VramUsage_Get");
-    if (!pfn_VramUsage) GET(pfn_VramUsage, "ADL2_Adapter_CurrentVramUsage_Get");
+    /* ADL2 memory usage -- returned in megabytes */
+    GET(pfn_VramUsage2,           "ADL2_Adapter_VRAMUsage_Get");
+    GET(pfn_DedicatedVramUsage2,  "ADL2_Adapter_DedicatedVRAMUsage_Get");
+    GET(pfn_SharedVramUsage2,     "ADL2_Adapter_SharedVRAMUsage_Get");
 
-    /* create ADL context */
+    /* create ADL2 context first (needed by modern functions) */
+    if (pfn_Create2) {
+        r = pfn_Create2(adl_malloc, 1, &g_adl2_ctx);
+        if (r != ADL_OK) {
+            fprintf(stderr, "ADL: ADL2_Main_Control_Create failed (%d)\n", r);
+            g_adl2_ctx = NULL;
+        }
+    }
+
+    /* create global ADL context (needed by legacy functions) */
     r = pfn_Create(adl_malloc, 1);
-    if (r != ADL_OK) { fprintf(stderr, "ADL: Create failed (%d)\n", r); goto fail; }
+    if (r != ADL_OK) {
+        fprintf(stderr, "ADL: Create failed (%d)\n", r);
+        goto fail;
+    }
 
     /* enumerate adapters */
     r = pfn_NumAdapters(&g_num_adapters);
     if (r != ADL_OK || g_num_adapters <= 0) {
-        fprintf(stderr, "ADL: no adapters\n"); goto fail;
+        fprintf(stderr, "ADL: no adapters\n");
+        goto fail;
     }
 
     g_adapters = (ADLAdapterInfo*)calloc((size_t)g_num_adapters,
@@ -233,6 +277,7 @@ int adl_init(void)
     return 0;
 
 fail:
+    if (g_adl2_ctx && pfn_Destroy2) { pfn_Destroy2(g_adl2_ctx); g_adl2_ctx = NULL; }
     if (g_hDll) { FreeLibrary(g_hDll); g_hDll = NULL; }
     g_init_ok = -1;
     return -1;
@@ -245,6 +290,10 @@ fail:
 void adl_shutdown(void)
 {
     if (g_adapters)  { free(g_adapters); g_adapters = NULL; }
+    if (g_adl2_ctx && pfn_Destroy2) {
+        pfn_Destroy2(g_adl2_ctx);
+        g_adl2_ctx = NULL;
+    }
     if (g_hDll) {
         if (pfn_Destroy) pfn_Destroy();
         FreeLibrary(g_hDll);
@@ -290,18 +339,16 @@ int adl_find_by_pci(uint32_t vendor_id, uint32_t device_id, int *adl_index)
 }
 
 /* ------------------------------------------------------------------
- *  Query helpers  --  try OverdriveN first, fall back to Overdrive5
+ *  Query helpers  --  try OverdriveN first, fall back to Overdrive5/6
  * ------------------------------------------------------------------ */
 
 int adl_get_temperature(int idx, int *milli_c)
 {
-    /* try OverdriveN */
-    if (pfn_ODN_Temp) {
-        ADLODNTemp t; memset(&t, 0, sizeof(t)); t.iSize = sizeof(t);
-        t.iTemperatureType[0] = 1; /* 1 = GPU edge */
-        int r = pfn_ODN_Temp(idx, &t);
-        if (r == ADL_OK && t.iTemperatureValue[0] > 0) {
-            *milli_c = t.iTemperatureValue[0];
+    /* try OverdriveN (ADL2) -- returned value is millidegrees C */
+    if (g_adl2_ctx && pfn_ODN_Temp2) {
+        int t = 0;
+        if (pfn_ODN_Temp2(g_adl2_ctx, idx, 1, &t) == ADL_OK && t > 0) {
+            *milli_c = t;
             return 0;
         }
     }
@@ -309,14 +356,13 @@ int adl_get_temperature(int idx, int *milli_c)
     /* try Overdrive5 (thermal controller 0) */
     if (pfn_OD5_Temp) {
         ADLOD5Temp t; memset(&t, 0, sizeof(t)); t.iSize = sizeof(t);
-        int r = pfn_OD5_Temp(idx, 0, &t);
-        if (r == ADL_OK && t.iTemperature > 0) {
+        if (pfn_OD5_Temp(idx, 0, &t) == ADL_OK && t.iTemperature > 0) {
             *milli_c = t.iTemperature;
             return 0;
         }
     }
 
-    /* try Overdrive6 (simpler signature: idx, &temp) */
+    /* try Overdrive6 (plain ADL) */
     if (pfn_OD6_Temp) {
         int val = 0;
         int r = pfn_OD6_Temp(idx, &val);
@@ -331,19 +377,9 @@ int adl_get_temperature(int idx, int *milli_c)
 
 int adl_get_fan_speed(int idx, int *rpm, int *percent)
 {
-    /* try OverdriveN */
-    if (pfn_ODN_Fan) {
-        ADLODNFan f; f.iSize = sizeof(f);
-        if (pfn_ODN_Fan(idx, &f) == ADL_OK) {
-            *rpm     = f.iFanSpeedRPM;
-            *percent = f.iFanSpeedPercent;
-            return 0;
-        }
-    }
-
-    /* try Overdrive5 */
+    /* Overdrive5 fan is sufficient for the data we expose */
     if (pfn_OD5_Fan) {
-        ADLOD5Fan f; f.iSize = sizeof(f);
+        ADLOD5Fan f; memset(&f, 0, sizeof(f)); f.iSize = sizeof(f);
         if (pfn_OD5_Fan(idx, 0, &f) == ADL_OK) {
             *rpm     = f.iFanSpeed;
             *percent = f.iFanPercent;
@@ -360,11 +396,10 @@ int adl_get_activity(int idx,
                       int *activity_pct,
                       int *perf_level)
 {
-    /* try OverdriveN */
-    if (pfn_ODN_Perf) {
-        ADLODNPerfStatus p; memset(&p, 0, sizeof(p)); p.iSize = sizeof(p);
-        int r = pfn_ODN_Perf(idx, &p);
-        if (r == ADL_OK) {
+    /* try OverdriveN (ADL2) */
+    if (g_adl2_ctx && pfn_ODN_Perf2) {
+        ADLODNPerfStatus p; memset(&p, 0, sizeof(p));
+        if (pfn_ODN_Perf2(g_adl2_ctx, idx, &p) == ADL_OK) {
             *eng_clock_10khz = p.iCoreClock;
             *mem_clock_10khz = p.iMemoryClock;
             *activity_pct    = p.iGPUActivityPercent;
@@ -388,47 +423,62 @@ int adl_get_activity(int idx,
     return -1;
 }
 
-int adl_get_speed(int idx, int *core_mhz, int *mem_mhz)
-{
-    if (pfn_AdapterSpeed) {
-        ADLAdapterSpeed s; memset(&s, 0, sizeof(s)); s.iSize = sizeof(s);
-        int r = pfn_AdapterSpeed(idx, &s);
-        if (r == ADL_OK) {
-            *core_mhz = s.iCoreClock;
-            *mem_mhz  = s.iMemoryClock;
-            return 0;
-        }
-    }
-    return -1;
-}
-
 int adl_get_memory(int idx, uint64_t *used_bytes, uint64_t *total_bytes)
 {
-    int ok = 0;
+    int ok_total = 0;
+    int ok_used  = 0;
+
+    *used_bytes  = 0;
+    *total_bytes = 0;
 
     /* total VRAM from ADL_Adapter_MemoryInfo_Get */
     if (pfn_MemoryInfo) {
-        ADLMemoryInfo mi; memset(&mi, 0, sizeof(mi)); mi.iSize = sizeof(mi);
+        ADLMemoryInfo mi; memset(&mi, 0, sizeof(mi));
         if (pfn_MemoryInfo(idx, &mi) == ADL_OK && mi.iMemorySize > 0) {
             *total_bytes = (uint64_t)mi.iMemorySize;
-            ok = 1;
+            ok_total = 1;
         }
     }
 
-    /* used VRAM from ADL2_Adapter_VramUsage_Get */
-    if (pfn_VramUsage) {
-        long long usage = 0;
-        int r = pfn_VramUsage(idx, &usage);
-        if (r == ADL_OK && usage >= 0) {
-            *used_bytes = (uint64_t)usage;
-            return 0;
+    /* fallback total for APUs / newer drivers */
+    if (!ok_total && pfn_MemoryInfo2) {
+        ADLMemoryInfo2 mi2; memset(&mi2, 0, sizeof(mi2));
+        if (pfn_MemoryInfo2(idx, &mi2) == ADL_OK && mi2.iMemorySize > 0) {
+            *total_bytes = (uint64_t)mi2.iMemorySize;
+            ok_total = 1;
         }
     }
 
-    if (ok) {
-        *used_bytes = 0; /* total is known but used is not available */
+    if (!g_adl2_ctx)
+        return ok_total ? 0 : -1;
+
+    /* ADL2 usage -- functions return megabytes.
+     * Prefer dedicated + shared; fall back to the aggregate value. */
+    {
+        int ded_mb = 0, shared_mb = 0, total_mb = 0;
+        int r1 = -1, r2 = -1, r3 = -1;
+
+        if (pfn_DedicatedVramUsage2)
+            r1 = pfn_DedicatedVramUsage2(g_adl2_ctx, idx, &ded_mb);
+        if (pfn_SharedVramUsage2)
+            r2 = pfn_SharedVramUsage2(g_adl2_ctx, idx, &shared_mb);
+
+        if ((r1 == ADL_OK && ded_mb >= 0) || (r2 == ADL_OK && shared_mb >= 0)) {
+            int sum = 0;
+            if (r1 == ADL_OK) sum += ded_mb;
+            if (r2 == ADL_OK) sum += shared_mb;
+            *used_bytes = (uint64_t)sum * 1024ULL * 1024ULL;
+            ok_used = 1;
+        } else if (pfn_VramUsage2 &&
+                   (r3 = pfn_VramUsage2(g_adl2_ctx, idx, &total_mb)) == ADL_OK &&
+                   total_mb >= 0) {
+            *used_bytes = (uint64_t)total_mb * 1024ULL * 1024ULL;
+            ok_used = 1;
+        }
+    }
+
+    if (ok_total || ok_used)
         return 0;
-    }
     return -1;
 }
 
