@@ -834,6 +834,66 @@ static void print_memory_json(const SysInfo *si, const GpuInfo *gpus, int count)
     fputs("\n}\n", stdout);
 }
 
+static void sys_json_write_cpu_only(const SysInfo *si)
+{
+    json_indent(1); fputs("\"system\": {\n", stdout);
+    json_indent(2); fputs("\"cpu\": {\n", stdout);
+    json_str_val(3, "name", si->cpu_name); fputs(",\n", stdout);
+    json_key(3, "cores");   fprintf(stdout, "%d,\n", si->cpu_cores);
+    json_key(3, "threads"); fprintf(stdout, "%d,\n", si->cpu_threads);
+    json_key(3, "freq_max_mhz"); fprintf(stdout, "%d\n", si->cpu_freq_max_mhz);
+    json_indent(2); fputs("}\n", stdout);
+    json_indent(1); fputc('}', stdout);
+}
+
+static void sys_json_write_ram_only(const SysInfo *si)
+{
+    json_indent(1); fputs("\"system\": {\n", stdout);
+    json_indent(2); fputs("\"memory\": {\n", stdout);
+    json_key(3, "total_bytes");
+    fprintf(stdout, "%llu,\n", (unsigned long long)si->memory_total_bytes);
+    json_key(3, "used_bytes");
+    fprintf(stdout, "%llu,\n", (unsigned long long)si->memory_used_bytes);
+    json_key(3, "swap_total_bytes");
+    fprintf(stdout, "%llu,\n", (unsigned long long)si->swap_total_bytes);
+    json_key(3, "swap_used_bytes");
+    fprintf(stdout, "%llu\n", (unsigned long long)si->swap_used_bytes);
+    json_indent(2); fputs("}\n", stdout);
+    json_indent(1); fputc('}', stdout);
+}
+
+static void print_cpu_ram_json(const SysInfo *si, int cpu, int ram)
+{
+    int need_comma = 0;
+    fputs("{\n", stdout);
+    json_indent(1); fputs("\"system\": {\n", stdout);
+    if (cpu) {
+        json_indent(2); fputs("\"cpu\": {\n", stdout);
+        json_str_val(3, "name", si->cpu_name); fputs(",\n", stdout);
+        json_key(3, "cores");   fprintf(stdout, "%d,\n", si->cpu_cores);
+        json_key(3, "threads"); fprintf(stdout, "%d,\n", si->cpu_threads);
+        json_key(3, "freq_max_mhz"); fprintf(stdout, "%d\n", si->cpu_freq_max_mhz);
+        json_indent(2); fputs("}", stdout);
+        need_comma = 1;
+    }
+    if (ram) {
+        if (need_comma) fputs(",\n", stdout);
+        json_indent(2); fputs("\"memory\": {\n", stdout);
+        json_key(3, "total_bytes");
+        fprintf(stdout, "%llu,\n", (unsigned long long)si->memory_total_bytes);
+        json_key(3, "used_bytes");
+        fprintf(stdout, "%llu,\n", (unsigned long long)si->memory_used_bytes);
+        json_key(3, "swap_total_bytes");
+        fprintf(stdout, "%llu,\n", (unsigned long long)si->swap_total_bytes);
+        json_key(3, "swap_used_bytes");
+        fprintf(stdout, "%llu\n", (unsigned long long)si->swap_used_bytes);
+        json_indent(2); fputs("}", stdout);
+    }
+    fputc('\n', stdout);
+    json_indent(1); fputs("}\n", stdout);
+    fputs("}\n", stdout);
+}
+
 /* ================================================================
  *  Core
  * ================================================================ */
@@ -843,6 +903,8 @@ int main(int argc, char *argv[])
     int json_mode = 0;
     int gpu_only = 0;
     int memory_only = 0;
+    int cpu_mode = 0;
+    int ram_mode = 0;
     int argi;
     for (argi = 1; argi < argc; argi++) {
         if (strcmp(argv[argi], "--json") == 0) {
@@ -851,6 +913,10 @@ int main(int argc, char *argv[])
             gpu_only = 1;
         } else if (strcmp(argv[argi], "--memory") == 0) {
             memory_only = 1;
+        } else if (strcmp(argv[argi], "--cpu") == 0) {
+            cpu_mode = 1;
+        } else if (strcmp(argv[argi], "--ram") == 0) {
+            ram_mode = 1;
         }
     }
 
@@ -860,6 +926,7 @@ int main(int argc, char *argv[])
     VkPhysicalDevice *phys_devices = NULL;
     uint32_t i;
 
+    if (!cpu_mode && !ram_mode) {
     /* -- create instance -------------------------------------------------- */
     VkApplicationInfo app_info = {0};
     app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -955,18 +1022,23 @@ int main(int argc, char *argv[])
         device_count = keep;
     }
     }
+    }
 
     /* -- output ----------------------------------------------------------- */
 
     /* collect system info */
     SysInfo si;
     memset(&si, 0, sizeof(si));
-    if (!gpu_only)
+    if (cpu_mode || ram_mode) {
+        if (cpu_mode) sys_collect_cpu_info(&si);
+        if (ram_mode) sys_collect_ram_info(&si);
+    } else if (!gpu_only) {
         sys_collect_info(&si);
+    }
 
     /* collect GPU data into structs when JSON is requested */
     GpuInfo *gpus = NULL;
-    if (json_mode && instance != VK_NULL_HANDLE) {
+    if (!cpu_mode && !ram_mode && json_mode && instance != VK_NULL_HANDLE) {
         gpus = (GpuInfo*)calloc((size_t)device_count, sizeof(GpuInfo));
         if (!gpus) {
             fprintf(stderr, "calloc failed\n");
@@ -980,7 +1052,7 @@ int main(int argc, char *argv[])
     }
 
     /* -- GPU text output -- */
-    if (!json_mode && instance != VK_NULL_HANDLE) {
+    if (!cpu_mode && !ram_mode && !json_mode && instance != VK_NULL_HANDLE) {
         uint32_t total = 0;
 
         printf("===== GPU Information (Vulkan + ADL/sysfs + NVML) =====\n");
@@ -1270,7 +1342,11 @@ int main(int argc, char *argv[])
     }
 
     /* -- system info output -- */
-    if (memory_only) {
+    if (cpu_mode || ram_mode) {
+        if (json_mode) {
+            print_cpu_ram_json(&si, cpu_mode, ram_mode);
+        }
+    } else if (memory_only) {
         if (json_mode) {
             if (instance != VK_NULL_HANDLE)
                 print_memory_json(&si, gpus, (int)device_count);

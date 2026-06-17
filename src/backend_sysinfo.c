@@ -27,15 +27,12 @@ typedef struct _OSVERSIONINFOEXW_NT {
 
 typedef NTSTATUS (WINAPI *RtlGetVersion_t)(OSVERSIONINFOEXW_NT *);
 
-int sys_collect_info(SysInfo *info)
+int sys_collect_os_info(SysInfo *info)
 {
     DWORD cb, type;
     HKEY hKey;
     LONG reg_rc;
 
-    memset(info, 0, sizeof(SysInfo));
-
-    /* ---- OS ----------------------------------------------------------- */
     /* host name */
     cb = sizeof(info->host_name);
     GetComputerNameA(info->host_name, &cb);
@@ -111,6 +108,15 @@ int sys_collect_info(SysInfo *info)
     /* uptime */
     info->uptime_seconds = GetTickCount64() / 1000;
 
+    return 0;
+}
+
+int sys_collect_cpu_info(SysInfo *info)
+{
+    DWORD cb, type;
+    HKEY hKey;
+    LONG reg_rc;
+
     /* ---- CPU ---------------------------------------------------------- */
     reg_rc = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
         "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
@@ -159,6 +165,11 @@ int sys_collect_info(SysInfo *info)
         if (info->cpu_cores == 0) info->cpu_cores = info->cpu_threads;
     }
 
+    return 0;
+}
+
+int sys_collect_ram_info(SysInfo *info)
+{
     /* ---- RAM ---------------------------------------------------------- */
     {
         MEMORYSTATUSEX memx;
@@ -185,6 +196,11 @@ int sys_collect_info(SysInfo *info)
         }
     }
 
+    return 0;
+}
+
+int sys_collect_disk_info(SysInfo *info)
+{
     /* ---- Disk --------------------------------------------------------- */
     {
         DWORD drives = GetLogicalDrives();
@@ -231,6 +247,18 @@ int sys_collect_info(SysInfo *info)
     return 0;
 }
 
+int sys_collect_info(SysInfo *info)
+{
+    memset(info, 0, sizeof(SysInfo));
+
+    sys_collect_os_info(info);
+    sys_collect_cpu_info(info);
+    sys_collect_ram_info(info);
+    sys_collect_disk_info(info);
+
+    return 0;
+}
+
 /* ================================================================
  *  Linux implementation
  * ================================================================ */
@@ -273,11 +301,8 @@ static long long read_proc_val(const char *path, const char *key)
     return -1;
 }
 
-int sys_collect_info(SysInfo *info)
+int sys_collect_os_info(SysInfo *info)
 {
-    memset(info, 0, sizeof(SysInfo));
-
-    /* ---- OS ----------------------------------------------------------- */
     /* host name */
     gethostname(info->host_name, sizeof(info->host_name));
 
@@ -326,6 +351,11 @@ int sys_collect_info(SysInfo *info)
         }
     }
 
+    return 0;
+}
+
+int sys_collect_cpu_info(SysInfo *info)
+{
     /* ---- CPU ---------------------------------------------------------- */
     {
         FILE *f = fopen("/proc/cpuinfo", "r");
@@ -376,6 +406,11 @@ int sys_collect_info(SysInfo *info)
         }
     }
 
+    return 0;
+}
+
+int sys_collect_ram_info(SysInfo *info)
+{
     /* ---- RAM ---------------------------------------------------------- */
     {
         long long total = read_proc_val("/proc/meminfo", "MemTotal");
@@ -395,6 +430,11 @@ int sys_collect_info(SysInfo *info)
         }
     }
 
+    return 0;
+}
+
+int sys_collect_disk_info(SysInfo *info)
+{
     /* ---- Disk --------------------------------------------------------- */
     {
         FILE *f = setmntent("/proc/mounts", "r");
@@ -443,6 +483,18 @@ int sys_collect_info(SysInfo *info)
             endmntent(f);
         }
     }
+
+    return 0;
+}
+
+int sys_collect_info(SysInfo *info)
+{
+    memset(info, 0, sizeof(SysInfo));
+
+    sys_collect_os_info(info);
+    sys_collect_cpu_info(info);
+    sys_collect_ram_info(info);
+    sys_collect_disk_info(info);
 
     return 0;
 }
