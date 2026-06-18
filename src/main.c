@@ -2,6 +2,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "gpu_info.h"
 #include "sys_info.h"
@@ -895,10 +899,59 @@ static void print_cpu_ram_json(const SysInfo *si, int cpu, int ram)
 }
 
 /* ================================================================
- *  Core
+ *  Signal handling
  * ================================================================ */
 
-int main(int argc, char *argv[])
+static volatile int g_exit_requested = 0;
+
+#ifdef _WIN32
+static BOOL WINAPI ctrl_handler(DWORD type)
+{
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) {
+        g_exit_requested = 1;
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
+static void sigint_handler(int sig)
+{
+    (void)sig;
+    g_exit_requested = 1;
+}
+#endif
+
+/* ================================================================
+ *  Help
+ * ================================================================ */
+
+static void print_help(void)
+{
+    printf("Available commands:\n");
+    printf("  --json           Output in JSON format\n");
+    printf("  --gpu            GPU information only\n");
+    printf("  --memory         Memory information only\n");
+    printf("  --cpu            CPU information only\n");
+    printf("  --ram            RAM information only\n");
+    printf("  --interactive    Force interactive mode (stdin non-TTY)\n");
+    printf("  --exit           Exit the program\n");
+    printf("  --quit           Exit the program\n");
+    printf("  --help           Show this help\n");
+    printf("\nExamples:\n");
+    printf("  gpu-info> --json\n");
+    printf("  gpu-info> --json --cpu\n");
+    printf("  gpu-info> --json --gpu\n");
+    printf("  gpu-info> --gpu\n");
+}
+
+/* ================================================================
+ *  do_output — collect + print, callable repeatedly
+ * ================================================================ */
+
+static int do_output(int argc, char *argv[],
+                     VkInstance instance,
+                     VkPhysicalDevice *phys_devices,
+                     uint32_t device_count)
 {
     int json_mode = 0;
     int gpu_only = 0;
@@ -906,7 +959,7 @@ int main(int argc, char *argv[])
     int cpu_mode = 0;
     int ram_mode = 0;
     int argi;
-    for (argi = 1; argi < argc; argi++) {
+    for (argi = 0; argi < argc; argi++) {
         if (strcmp(argv[argi], "--json") == 0) {
             json_mode = 1;
         } else if (strcmp(argv[argi], "--gpu") == 0) {
@@ -920,113 +973,9 @@ int main(int argc, char *argv[])
         }
     }
 
-    VkResult vkres;
-    VkInstance instance = VK_NULL_HANDLE;
-    uint32_t device_count = 0;
-    VkPhysicalDevice *phys_devices = NULL;
     uint32_t i;
 
-    if (!cpu_mode && !ram_mode) {
-    /* -- create instance -------------------------------------------------- */
-    VkApplicationInfo app_info = {0};
-    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app_info.pApplicationName = "gpu-info";
-    app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-    app_info.pEngineName = "gpu-info";
-    app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    app_info.apiVersion = VK_API_VERSION_1_1;
-
-    VkInstanceCreateInfo instance_ci = {0};
-    instance_ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    instance_ci.pApplicationInfo = &app_info;
-
-    /* -- init Vulkan backend (dynamic loading, linker-free) ------------- */
-    if (vulkan_backend_init() != 0) {
-        if (gpu_only) {
-            fprintf(stderr, "GPU-only mode requested but Vulkan loader is not available.\n");
-            return 1;
-        }
-    }
-
-    /* -- create Vulkan instance (only if backend loaded) --------------- */
-    if (vulkan_backend_loaded()) {
-        vkres = vkCreateInstance(&instance_ci, NULL, &instance);
-        if (vkres != VK_SUCCESS) {
-            fprintf(stderr, "Warning: vkCreateInstance failed: %d\n", vkres);
-            fprintf(stderr,
-                    "Make sure a Vulkan driver is installed.\n"
-                    "  Windows: install GPU vendor driver (NVIDIA/AMD/Intel)\n"
-                    "  Linux:   apt install vulkan-tools / mesa-vulkan-drivers\n");
-            if (gpu_only) {
-                fprintf(stderr, "GPU-only mode requested but no GPU is available.\n");
-                return 1;
-            }
-        }
-    }
-
-    if (instance != VK_NULL_HANDLE) {
-    /* -- init ADL (AMD dynamic info, Windows only) ------------------------ */
-#ifdef _WIN32
-    if (adl_init() != 0) {
-    }
-#endif
-
-    /* -- init sysfs (AMD dynamic info, Linux only) ------------------------- */
-#ifdef __linux__
-    if (sysfs_init() != 0) {
-    }
-#endif
-
-    /* -- init NVML (NVIDIA dynamic info, cross-platform) ------------------- */
-    if (nvml_init() != 0) {
-    }
-
-    /* -- enumerate physical devices --------------------------------------- */
-    vkres = vkEnumeratePhysicalDevices(instance, &device_count, NULL);
-    if (vkres != VK_SUCCESS || device_count == 0) {
-        fprintf(stderr, "Warning: No Vulkan-capable GPU found.\n");
-        vkDestroyInstance(instance, NULL);
-        instance = VK_NULL_HANDLE;
-        if (gpu_only) {
-            return 1;
-        }
-    }
-    }
-
-    if (instance != VK_NULL_HANDLE) {
-    phys_devices = (VkPhysicalDevice*)malloc(sizeof(VkPhysicalDevice) * device_count);
-    if (!phys_devices) {
-        fprintf(stderr, "malloc failed\n");
-        vkDestroyInstance(instance, NULL);
-        return 1;
-    }
-
-    vkres = vkEnumeratePhysicalDevices(instance, &device_count, phys_devices);
-    if (vkres != VK_SUCCESS) {
-        fprintf(stderr, "vkEnumeratePhysicalDevices failed: %d\n", vkres);
-        free(phys_devices);
-        vkDestroyInstance(instance, NULL);
-        return 1;
-    }
-
-    /* -- filter out llvmpipe software renderers --------------------------- */
-    {
-        uint32_t keep = 0;
-        for (i = 0; i < device_count; i++) {
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(phys_devices[i], &props);
-            if (strstr(props.deviceName, "llvmpipe")) continue;
-            if (keep != i) phys_devices[keep] = phys_devices[i];
-            keep++;
-        }
-        device_count = keep;
-    }
-    }
-    }
-
-    /* -- output ----------------------------------------------------------- */
-
-    /* collect system info */
+    /* -- collect system info -- */
     SysInfo si;
     memset(&si, 0, sizeof(si));
     if (cpu_mode || ram_mode) {
@@ -1036,14 +985,12 @@ int main(int argc, char *argv[])
         sys_collect_info(&si);
     }
 
-    /* collect GPU data into structs when JSON is requested */
+    /* -- collect GPU data for JSON output -- */
     GpuInfo *gpus = NULL;
     if (!cpu_mode && !ram_mode && json_mode && instance != VK_NULL_HANDLE) {
         gpus = (GpuInfo*)calloc((size_t)device_count, sizeof(GpuInfo));
         if (!gpus) {
             fprintf(stderr, "calloc failed\n");
-            free(phys_devices);
-            vkDestroyInstance(instance, NULL);
             return 1;
         }
         for (i = 0; i < device_count; i++) {
@@ -1066,7 +1013,6 @@ int main(int argc, char *argv[])
             vkGetPhysicalDeviceProperties(phys_devices[i], &props);
             vkGetPhysicalDeviceMemoryProperties(phys_devices[i], &mem);
 
-            /* calculate memory sums */
             uint64_t dedicated_vram = 0;
             uint64_t shared_ram = 0;
             uint32_t h;
@@ -1078,7 +1024,6 @@ int main(int argc, char *argv[])
                 }
             }
 
-            /* sysfs memory: for AMD iGPUs, use vram+gtt from amdgpu */
 #ifdef __linux__
             if (props.vendorID == 0x1002 &&
                 props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
@@ -1121,7 +1066,6 @@ int main(int argc, char *argv[])
             printf("  Driver Version  : %s (raw: 0x%08X)\n",
                    driver_buf, props.driverVersion);
 
-            /* memory heap breakdown */
             printf("  Memory Heaps    : %u\n", mem.memoryHeapCount);
             for (h = 0; h < mem.memoryHeapCount; h++) {
                 char heap_buf[64];
@@ -1133,7 +1077,6 @@ int main(int argc, char *argv[])
                 printf("    Heap %u: %-10s  [%s]\n", h, heap_buf, heap_type);
             }
 
-            /* -- ADL dynamic info for AMD GPUs (Windows only) ------------------- */
 #ifdef _WIN32
             if (props.vendorID == 0x1002) {
                 int adl_idx;
@@ -1183,7 +1126,6 @@ int main(int argc, char *argv[])
             }
 #endif
 
-            /* -- sysfs dynamic info for AMD GPUs (Linux only) ----------------- */
 #ifdef __linux__
             if (props.vendorID == 0x1002) {
                 int s_idx;
@@ -1250,7 +1192,6 @@ int main(int argc, char *argv[])
             }
 #endif
 
-            /* -- NVML dynamic info for NVIDIA GPUs (cross-platform) ------------- */
             if (props.vendorID == 0x10DE) {
                 int nv_idx;
                 VkPhysicalDeviceProperties2 nv_props2 = {0};
@@ -1345,6 +1286,9 @@ int main(int argc, char *argv[])
     if (cpu_mode || ram_mode) {
         if (json_mode) {
             print_cpu_ram_json(&si, cpu_mode, ram_mode);
+        } else {
+            putchar('\n');
+            sys_print_text(&si);
         }
     } else if (memory_only) {
         if (json_mode) {
@@ -1352,6 +1296,9 @@ int main(int argc, char *argv[])
                 print_memory_json(&si, gpus, (int)device_count);
             else
                 print_memory_json(&si, NULL, 0);
+        } else {
+            putchar('\n');
+            sys_print_text(&si);
         }
     } else if (!gpu_only) {
         if (json_mode) {
@@ -1368,8 +1315,235 @@ int main(int argc, char *argv[])
     }
 
     free(gpus);
+    return 0;
+}
 
-    /* -- cleanup ---------------------------------------------------------- */
+/* ================================================================
+ *  REPL loop
+ * ================================================================ */
+
+#define REPL_LINE_MAX 4096
+
+static void repl_loop(VkInstance instance,
+                      VkPhysicalDevice *phys_devices,
+                      uint32_t device_count)
+{
+    char line[REPL_LINE_MAX];
+
+    while (!g_exit_requested) {
+        printf("gpu-info> ");
+        fflush(stdout);
+
+        if (!fgets(line, sizeof(line), stdin)) {
+            break;
+        }
+
+        /* strip trailing newline */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+
+        if (len == 0) continue;
+
+        /* tokenize */
+        char *tokenv[256];
+        int tokc = 0;
+        char *p = line;
+        int in_token = 0;
+        while (*p) {
+            if (*p == ' ' || *p == '\t') {
+                if (in_token) {
+                    *p = '\0';
+                    in_token = 0;
+                }
+            } else {
+                if (!in_token) {
+                    if (tokc < 256) tokenv[tokc++] = p;
+                    in_token = 1;
+                }
+            }
+            p++;
+        }
+
+        if (tokc == 0) continue;
+
+        if (strcmp(tokenv[0], "--exit") == 0 ||
+            strcmp(tokenv[0], "--quit") == 0) {
+            break;
+        }
+
+        if (strcmp(tokenv[0], "--help") == 0) {
+            print_help();
+            continue;
+        }
+
+        do_output(tokc, tokenv, instance, phys_devices, device_count);
+        fputc('\n', stdout);
+    }
+}
+
+/* ================================================================
+ *  Main
+ * ================================================================ */
+
+int main(int argc, char *argv[])
+{
+#ifdef _WIN32
+    SetConsoleCtrlHandler(ctrl_handler, TRUE);
+#else
+    signal(SIGINT, sigint_handler);
+#endif
+
+    /* -- early exit for meta commands in batch mode -- */
+    {
+        int argi;
+        for (argi = 1; argi < argc; argi++) {
+            if (strcmp(argv[argi], "--exit") == 0 ||
+                strcmp(argv[argi], "--quit") == 0) {
+                return 0;
+            }
+            if (strcmp(argv[argi], "--help") == 0) {
+                print_help();
+                return 0;
+            }
+        }
+    }
+
+    VkResult vkres;
+    VkInstance instance = VK_NULL_HANDLE;
+    uint32_t device_count = 0;
+    VkPhysicalDevice *phys_devices = NULL;
+    uint32_t i;
+
+    int interactive = (argc == 1);
+    {
+        int argi;
+        for (argi = 1; argi < argc; argi++) {
+            if (strcmp(argv[argi], "--interactive") == 0) interactive = 1;
+        }
+    }
+    int gpu_only = 0;
+    {
+        int argi;
+        for (argi = 1; argi < argc; argi++) {
+            if (strcmp(argv[argi], "--gpu") == 0) gpu_only = 1;
+        }
+    }
+
+    /* decide whether Vulkan / backends are needed */
+    int need_vulkan = interactive;
+    if (!interactive) {
+        int only_cpu_ram = 1;
+        int argi;
+        for (argi = 1; argi < argc; argi++) {
+            if (strcmp(argv[argi], "--cpu") != 0 &&
+                strcmp(argv[argi], "--ram") != 0) {
+                only_cpu_ram = 0;
+                break;
+            }
+        }
+        need_vulkan = !only_cpu_ram;
+    }
+
+    if (need_vulkan) {
+        if (vulkan_backend_init() != 0) {
+            if (gpu_only) {
+                fprintf(stderr, "GPU-only mode requested but Vulkan loader is not available.\n");
+                return 1;
+            }
+        }
+
+        if (vulkan_backend_loaded()) {
+            VkApplicationInfo app_info = {0};
+            app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+            app_info.pApplicationName = "gpu-info";
+            app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+            app_info.pEngineName = "gpu-info";
+            app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+            app_info.apiVersion = VK_API_VERSION_1_1;
+
+            VkInstanceCreateInfo instance_ci = {0};
+            instance_ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+            instance_ci.pApplicationInfo = &app_info;
+
+            vkres = vkCreateInstance(&instance_ci, NULL, &instance);
+            if (vkres != VK_SUCCESS) {
+                fprintf(stderr, "Warning: vkCreateInstance failed: %d\n", vkres);
+                fprintf(stderr,
+                        "Make sure a Vulkan driver is installed.\n"
+                        "  Windows: install GPU vendor driver (NVIDIA/AMD/Intel)\n"
+                        "  Linux:   apt install vulkan-tools / mesa-vulkan-drivers\n");
+                if (gpu_only) {
+                    fprintf(stderr, "GPU-only mode requested but no GPU is available.\n");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    if (instance != VK_NULL_HANDLE) {
+#ifdef _WIN32
+        adl_init();
+#endif
+#ifdef __linux__
+        sysfs_init();
+#endif
+        nvml_init();
+
+        vkres = vkEnumeratePhysicalDevices(instance, &device_count, NULL);
+        if (vkres != VK_SUCCESS || device_count == 0) {
+            fprintf(stderr, "Warning: No Vulkan-capable GPU found.\n");
+            vkDestroyInstance(instance, NULL);
+            instance = VK_NULL_HANDLE;
+            if (gpu_only) {
+                return 1;
+            }
+        }
+    }
+
+    if (instance != VK_NULL_HANDLE) {
+        phys_devices = (VkPhysicalDevice*)malloc(sizeof(VkPhysicalDevice) * device_count);
+        if (!phys_devices) {
+            fprintf(stderr, "malloc failed\n");
+            vkDestroyInstance(instance, NULL);
+            return 1;
+        }
+
+        vkres = vkEnumeratePhysicalDevices(instance, &device_count, phys_devices);
+        if (vkres != VK_SUCCESS) {
+            fprintf(stderr, "vkEnumeratePhysicalDevices failed: %d\n", vkres);
+            free(phys_devices);
+            vkDestroyInstance(instance, NULL);
+            return 1;
+        }
+
+        {
+            uint32_t keep = 0;
+            for (i = 0; i < device_count; i++) {
+                VkPhysicalDeviceProperties props;
+                vkGetPhysicalDeviceProperties(phys_devices[i], &props);
+                if (strstr(props.deviceName, "llvmpipe")) continue;
+                if (keep != i) phys_devices[keep] = phys_devices[i];
+                keep++;
+            }
+            device_count = keep;
+        }
+    }
+
+    /* -- dispatch -- */
+    if (interactive) {
+        if (instance == VK_NULL_HANDLE) {
+            printf("Interactive mode — no Vulkan GPU detected, system info only.\n");
+        } else {
+            printf("Interactive mode. Type --help for commands, --exit to quit.\n");
+        }
+        repl_loop(instance, phys_devices, device_count);
+    } else {
+        do_output(argc - 1, argv + 1, instance, phys_devices, device_count);
+    }
+
+    /* -- cleanup -- */
     free(phys_devices);
     nvml_shutdown();
 #ifdef _WIN32
