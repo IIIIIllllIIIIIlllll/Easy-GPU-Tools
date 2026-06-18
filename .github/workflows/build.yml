@@ -25,6 +25,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        # Full history + tags so CMake can parse the latest git tag for
+        # the VERSIONINFO resource embedded in the Windows binary.
+        fetch-depth: 0
 
     - name: Install Vulkan SDK (Linux)
       if: runner.os == 'Linux'
