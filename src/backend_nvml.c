@@ -41,17 +41,24 @@ typedef enum {
     NVML_ECC_PENDING  = 2
 } nvmlEnableState_t;  /* 0 = disabled, 1 = enabled */
 
+/* Must match the real nvmlPciInfo_t layout from nvml.h:
+ *   domain, bus, device, pciDeviceId, pciSubSystemId,
+ *   busIdLegacy[16], busId[32]
+ * NVML does not expose a PCI function field (it is always 0 for a GPU),
+ * and the structure has no version field. Mismatching the layout corrupts
+ * the cached PCI info and makes every Vulkan GPU match the first NVML
+ * device, so multi-GPU systems report identical sensor data for all cards. */
+#define NVML_DEVICE_PCI_BUS_ID_BUFFER_V2_SIZE 16
+#define NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE    32
+
 typedef struct {
-    unsigned int  version;
-    char          busIdLegacy[16];
     unsigned int  domain;
     unsigned int  bus;
     unsigned int  device;
-    unsigned int  function;
     unsigned int  pciDeviceId;
     unsigned int  pciSubSystemId;
-    char          busId[32];
-    /* more fields we don't use */
+    char          busIdLegacy[NVML_DEVICE_PCI_BUS_ID_BUFFER_V2_SIZE];
+    char          busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
 } nvmlPciInfo_t;
 
 typedef struct {
@@ -198,7 +205,6 @@ int nvml_init(void)
 
     for (i = 0; i < g_num_devices; i++) {
         nvmlPciInfo_t pci = {0};
-        pci.version = sizeof(nvmlPciInfo_t);
         g_devices[i] = NULL;
         r = pfn_GetHandleByIndex(i, &g_devices[i]);
         if (r != NVML_SUCCESS) continue;
@@ -206,7 +212,7 @@ int nvml_init(void)
             g_pci_info[i].domain   = pci.domain;
             g_pci_info[i].bus      = pci.bus;
             g_pci_info[i].device   = pci.device;
-            g_pci_info[i].function = pci.function;
+            g_pci_info[i].function = 0;  /* GPU is always function 0; NVML has no function field */
             g_pci_info[i].valid    = 1;
         }
     }
