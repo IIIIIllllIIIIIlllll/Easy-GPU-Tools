@@ -143,7 +143,6 @@ typedef struct {
 static unsigned int  g_num_devices = 0;
 static nvmlDevice_t  g_devices[NVML_MAX_DEVICES];
 static NvmlPciInfo   g_pci_info[NVML_MAX_DEVICES];
-static int           g_fallback_idx = 0;
 
 /* ------------------------------------------------------------------
  *  Helper macro
@@ -236,7 +235,6 @@ void nvml_shutdown(void)
     memset(g_devices, 0, sizeof(g_devices));
     memset(g_pci_info, 0, sizeof(g_pci_info));
     g_num_devices = 0;
-    g_fallback_idx = 0;
     g_init_ok = 0;
 }
 
@@ -259,16 +257,17 @@ int nvml_find_by_pci(unsigned int domain, unsigned int bus,
             g_pci_info[i].bus      == bus &&
             g_pci_info[i].device   == device &&
             g_pci_info[i].function == function) {
-            g_fallback_idx = i + 1;
             *index = (int)i;
             return 0;
         }
     }
 
-    /* Fallback: sequential mapping when PCI info is unavailable */
-    if (g_fallback_idx < (int)g_num_devices) {
-        *index = g_fallback_idx++;
-        return 0;
+    /* Fallback: return first valid device handle when PCI info unavailable */
+    for (i = 0; i < g_num_devices; i++) {
+        if (g_devices[i]) {
+            *index = (int)i;
+            return 0;
+        }
     }
     return -1;
 }
