@@ -84,6 +84,19 @@ typedef struct {
     unsigned long long used;
 } nvmlMemory_t;
 
+/* Memory info v2 -- field order matches nvml.h nvmlMemory_v2_st:
+ *   version, [pad], total, reserved, free, used
+ * Unlike v1, 'used' is allocated memory ONLY (excludes driver-reserved),
+ * matching what nvidia-smi reports. v1 'used' = reserved + allocated. */
+typedef struct {
+    unsigned int       version;    /* offset 0  -- set by caller to NVML version */
+    unsigned int       _pad;       /* offset 4  -- alignment (8-byte for ull) */
+    unsigned long long total;      /* offset 8  */
+    unsigned long long reserved;   /* offset 16 */
+    unsigned long long free;       /* offset 24 */
+    unsigned long long used;       /* offset 32 -- allocated only */
+} nvmlMemory_v2_t;
+
 /* ------------------------------------------------------------------
  *  Function pointer typedefs
  * ------------------------------------------------------------------ */
@@ -100,6 +113,7 @@ typedef int (*PFN_nvmlDeviceGetClockInfo)(nvmlDevice_t, int, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetPowerUsage)(nvmlDevice_t, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetPowerManagementLimit)(nvmlDevice_t, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t*);
+typedef int (*PFN_nvmlDeviceGetMemoryInfo_v2)(nvmlDevice_t, nvmlMemory_v2_t*);
 typedef int (*PFN_nvmlDeviceGetFanSpeed)(nvmlDevice_t, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetPerformanceState)(nvmlDevice_t, int*);
 typedef int (*PFN_nvmlDeviceGetEccMode)(nvmlDevice_t, int*, int*);
@@ -135,6 +149,7 @@ static PFN_nvmlDeviceGetClockInfo            pfn_GetClock = NULL;
 static PFN_nvmlDeviceGetPowerUsage           pfn_GetPower = NULL;
 static PFN_nvmlDeviceGetPowerManagementLimit pfn_GetPowerLimit = NULL;
 static PFN_nvmlDeviceGetMemoryInfo           pfn_GetMem = NULL;
+static PFN_nvmlDeviceGetMemoryInfo_v2        pfn_GetMem2 = NULL;
 static PFN_nvmlDeviceGetFanSpeed             pfn_GetFan = NULL;
 static PFN_nvmlDeviceGetPerformanceState     pfn_GetPState = NULL;
 static PFN_nvmlDeviceGetEccMode              pfn_GetEcc = NULL;
@@ -197,6 +212,7 @@ int nvml_init(void)
     RESOLVE(pfn_GetPower,     "nvmlDeviceGetPowerUsage");
     RESOLVE(pfn_GetPowerLimit,"nvmlDeviceGetPowerManagementLimit");
     RESOLVE(pfn_GetMem,       "nvmlDeviceGetMemoryInfo");
+    RESOLVE(pfn_GetMem2,      "nvmlDeviceGetMemoryInfo_v2");
     RESOLVE(pfn_GetFan,       "nvmlDeviceGetFanSpeed");
     RESOLVE(pfn_GetPState,    "nvmlDeviceGetPerformanceState");
     RESOLVE(pfn_GetEcc,       "nvmlDeviceGetEccMode");
@@ -408,13 +424,30 @@ int nvml_get_power(int idx, int *usage_w, int *limit_w)
 
 int nvml_get_memory(int idx, unsigned int *used_mb, unsigned int *total_mb)
 {
-    nvmlMemory_t m = {0};
     CHECK(idx);
-    if (!pfn_GetMem) return -1;
-    if (pfn_GetMem(g_devices[idx], &m) != NVML_SUCCESS) return -1;
-    *used_mb  = (unsigned int)(m.used  / (1024ULL * 1024ULL));
-    *total_mb = (unsigned int)(m.total / (1024ULL * 1024ULL));
-    return 0;
+
+    /* Prefer v2: 'used' is allocated memory only (matches nvidia-smi).
+     * v1 'used' = reserved + allocated, which over-reports on idle GPUs. */
+    if (pfn_GetMem2) {
+        nvmlMemory_v2_t m2 = {0};
+        m2.version = (unsigned int)sizeof(nvmlMemory_v2_t) | (2U << 24);
+        if (pfn_GetMem2(g_devices[idx], &m2) == NVML_SUCCESS && m2.total > 0) {
+            *used_mb  = (unsigned int)(m2.used  / (1024ULL * 1024ULL));
+            *total_mb = (unsigned int)(m2.total / (1024ULL * 1024ULL));
+            return 0;
+        }
+    }
+
+    /* Fallback: v1 (used = reserved + allocated) */
+    if (pfn_GetMem) {
+        nvmlMemory_t m = {0};
+        if (pfn_GetMem(g_devices[idx], &m) == NVML_SUCCESS) {
+            *used_mb  = (unsigned int)(m.used  / (1024ULL * 1024ULL));
+            *total_mb = (unsigned int)(m.total / (1024ULL * 1024ULL));
+            return 0;
+        }
+    }
+    return -1;
 }
 
 int nvml_get_fan(int idx, int *percent)
