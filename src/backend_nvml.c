@@ -181,8 +181,16 @@ int nvml_init(void)
         !RESOLVE(pfn_GetCount, "nvmlDeviceGetCount")) goto fail;
     if (!RESOLVE(pfn_GetHandleByIndex, "nvmlDeviceGetHandleByIndex_v2") &&
         !RESOLVE(pfn_GetHandleByIndex, "nvmlDeviceGetHandleByIndex")) goto fail;
-    /* GetPciInfo is needed for matching identical GPU models */
-    RESOLVE(pfn_GetPciInfo, "nvmlDeviceGetPciInfo_v3");
+    /* GetPciInfo is needed for matching identical GPU models.
+     * v3 is canonical since ~2014; fall back to v2/v1 for older drivers. */
+    if (!RESOLVE(pfn_GetPciInfo, "nvmlDeviceGetPciInfo_v3") &&
+        !RESOLVE(pfn_GetPciInfo, "nvmlDeviceGetPciInfo_v2") &&
+        !RESOLVE(pfn_GetPciInfo, "nvmlDeviceGetPciInfo")) {
+        fprintf(stderr, "[gpu-info] NVML: nvmlDeviceGetPciInfo symbol NOT resolved; "
+                        "PCI matching disabled (multi-GPU will collapse to device 0)\n");
+    } else {
+        fprintf(stderr, "[gpu-info] NVML: nvmlDeviceGetPciInfo resolved\n");
+    }
 
     RESOLVE(pfn_GetTemp,      "nvmlDeviceGetTemperature");
     RESOLVE(pfn_GetUtil,      "nvmlDeviceGetTotalUtilization");
@@ -207,13 +215,38 @@ int nvml_init(void)
         nvmlPciInfo_t pci = {0};
         g_devices[i] = NULL;
         r = pfn_GetHandleByIndex(i, &g_devices[i]);
-        if (r != NVML_SUCCESS) continue;
+        if (r != NVML_SUCCESS) {
+            fprintf(stderr, "[gpu-info] NVML: GetHandleByIndex(%u) failed r=%d\n", i, r);
+            continue;
+        }
         if (pfn_GetPciInfo && pfn_GetPciInfo(g_devices[i], &pci) == NVML_SUCCESS) {
             g_pci_info[i].domain   = pci.domain;
             g_pci_info[i].bus      = pci.bus;
             g_pci_info[i].device   = pci.device;
             g_pci_info[i].function = 0;  /* GPU is always function 0; NVML has no function field */
             g_pci_info[i].valid    = 1;
+
+            /* Diagnostic: dump cached PCI + raw busId/busIdLegacy bytes so
+             * we can verify the struct layout matches the driver's. */
+            fprintf(stderr, "[gpu-info] NVML dev %u: pci=%08X:%02X:%02X.0 "
+                            "pciDeviceId=%08X pciSubSystemId=%08X\n",
+                    i, pci.domain, pci.bus, pci.device,
+                    pci.pciDeviceId, pci.pciSubSystemId);
+            fprintf(stderr, "[gpu-info] NVML dev %u: busIdLegacy=\"%s\" busId=\"%s\"\n",
+                    i, pci.busIdLegacy, pci.busId);
+            {
+                unsigned int k;
+                fprintf(stderr, "[gpu-info] NVML dev %u: busIdLegacy hex:", i);
+                for (k = 0; k < sizeof(pci.busIdLegacy); k++)
+                    fprintf(stderr, " %02X", (unsigned)(unsigned char)pci.busIdLegacy[k]);
+                fprintf(stderr, "\n[gpu-info] NVML dev %u: busId hex:", i);
+                for (k = 0; k < sizeof(pci.busId); k++)
+                    fprintf(stderr, " %02X", (unsigned)(unsigned char)pci.busId[k]);
+                fprintf(stderr, "\n");
+            }
+        } else {
+            fprintf(stderr, "[gpu-info] NVML dev %u: GetPciInfo failed (pfn=%p)\n",
+                    i, (void*)pfn_GetPciInfo);
         }
     }
 
@@ -255,26 +288,43 @@ int nvml_find_by_pci(unsigned int domain, unsigned int bus,
     unsigned int i;
     if (g_init_ok <= 0) return -1;
 
+    fprintf(stderr, "[gpu-info] NVML find: requested Vulkan PCI %08X:%02X:%02X.%X\n",
+            domain, bus, device, function);
+
     /* PCI topology exact match */
     for (i = 0; i < g_num_devices; i++) {
         if (!g_devices[i]) continue;
-        if (!g_pci_info[i].valid) continue;
+        if (!g_pci_info[i].valid) {
+            fprintf(stderr, "[gpu-info] NVML find:   dev %u: (not cached)\n", i);
+            continue;
+        }
+        fprintf(stderr, "[gpu-info] NVML find:   dev %u: %08X:%02X:%02X.%X%s\n",
+                i, g_pci_info[i].domain, g_pci_info[i].bus,
+                g_pci_info[i].device, g_pci_info[i].function,
+                (g_pci_info[i].domain == domain &&
+                 g_pci_info[i].bus == bus &&
+                 g_pci_info[i].device == device &&
+                 g_pci_info[i].function == function) ? "  <-- MATCH" : "");
         if (g_pci_info[i].domain   == domain &&
             g_pci_info[i].bus      == bus &&
             g_pci_info[i].device   == device &&
             g_pci_info[i].function == function) {
             *index = (int)i;
+            fprintf(stderr, "[gpu-info] NVML find: -> matched dev %d\n", (int)i);
             return 0;
         }
     }
 
     /* Fallback: return first valid device handle when PCI info unavailable */
+    fprintf(stderr, "[gpu-info] NVML find: no exact PCI match, using fallback\n");
     for (i = 0; i < g_num_devices; i++) {
         if (g_devices[i]) {
             *index = (int)i;
+            fprintf(stderr, "[gpu-info] NVML find: -> fallback dev %d\n", (int)i);
             return 0;
         }
     }
+    fprintf(stderr, "[gpu-info] NVML find: -> no device available\n");
     return -1;
 }
 
