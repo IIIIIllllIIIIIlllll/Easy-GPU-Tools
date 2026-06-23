@@ -29,6 +29,14 @@
 typedef struct {
     int  vendor_id;
     int  device_id;
+    /* PCI topology cached from .../device/uevent PCI_SLOT_NAME
+     * (format "0000:01:00.0"). Used to distinguish multiple identical
+     * AMD GPUs that share the same vendor+device id. */
+    unsigned int pci_domain;
+    unsigned int pci_bus;
+    unsigned int pci_device;
+    unsigned int pci_function;
+    int          pci_valid;
     char card_path[PATH_MAX + 64];   /* /sys/class/drm/cardN         */
     char hwmon_path[PATH_MAX + 64];  /* .../device/hwmon/hwmonX     */
     char dev_path[PATH_MAX + 64];    /* .../device                   */
@@ -103,6 +111,39 @@ static int find_hwmon(const char *dev_path, char *out, size_t out_sz)
     return -1;
 }
 
+/* Parse PCI topology from <dev_path>/uevent.
+ * The file contains lines like "PCI_SLOT_NAME=0000:01:00.0"; we scan for
+ * that line and parse domain:bus:device.function (all hex). Returns 0 on
+ * success. Filling the cache lets two identical AMD GPUs be told apart by
+ * PCI slot rather than collapsing onto card0. */
+static int read_pci_topology(const char *dev_path,
+                             unsigned int *domain, unsigned int *bus,
+                             unsigned int *device, unsigned int *function)
+{
+    char uevent_path[PATH_MAX + 128];
+    char line[256];
+    FILE *f;
+
+    snprintf(uevent_path, sizeof(uevent_path), "%s/uevent", dev_path);
+    f = fopen(uevent_path, "r");
+    if (!f) return -1;
+
+    while (fgets(line, sizeof(line), f)) {
+        unsigned int d, b, dev, fn;
+        if (strncmp(line, "PCI_SLOT_NAME=", 14) != 0) continue;
+        if (sscanf(line + 14, "%x:%x:%x.%x", &d, &b, &dev, &fn) == 4) {
+            *domain   = d;
+            *bus      = b;
+            *device   = dev;
+            *function = fn;
+            fclose(f);
+            return 0;
+        }
+    }
+    fclose(f);
+    return -1;
+}
+
 /* ------------------------------------------------------------------
  *  sysfs_init  --  scan /sys/class/drm/ for render-capable cards
  * ------------------------------------------------------------------ */
@@ -159,6 +200,14 @@ int sysfs_init(void)
         find_hwmon(dev_path, g_gpus[i].hwmon_path,
                    sizeof(g_gpus[i].hwmon_path));
 
+        /* cache PCI topology so identical GPUs can be told apart */
+        if (read_pci_topology(dev_path,
+                              &g_gpus[i].pci_domain,
+                              &g_gpus[i].pci_bus,
+                              &g_gpus[i].pci_device,
+                              &g_gpus[i].pci_function) == 0)
+            g_gpus[i].pci_valid = 1;
+
         g_gpus[i].valid = 1;
         g_num_gpus++;
     }
@@ -189,6 +238,29 @@ int sysfs_find_by_vendor_device(int vendor_id, int device_id, int *gpu_index)
         if (!g_gpus[i].valid) continue;
         if (g_gpus[i].vendor_id == vendor_id &&
             g_gpus[i].device_id == device_id) {
+            *gpu_index = i;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Match by PCI bus topology (domain:bus:device.function). This is what
+ * lets two identical AMD GPUs (same vendor+device) be distinguished;
+ * sysfs_find_by_vendor_device would otherwise always return card0. */
+int sysfs_find_by_pci_topology(uint32_t domain, uint32_t bus,
+                               uint32_t device, uint32_t function,
+                               int *gpu_index)
+{
+    int i;
+    if (g_init_ok <= 0) return -1;
+
+    for (i = 0; i < g_num_gpus; i++) {
+        if (!g_gpus[i].valid || !g_gpus[i].pci_valid) continue;
+        if (g_gpus[i].pci_domain   == domain &&
+            g_gpus[i].pci_bus      == bus &&
+            g_gpus[i].pci_device   == device &&
+            g_gpus[i].pci_function == function) {
             *gpu_index = i;
             return 0;
         }

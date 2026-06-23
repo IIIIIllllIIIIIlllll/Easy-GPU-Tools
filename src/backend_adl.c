@@ -339,6 +339,34 @@ int adl_find_by_pci(uint32_t vendor_id, uint32_t device_id, int *adl_index)
 }
 
 /* ------------------------------------------------------------------
+ *  adl_find_by_pci_topology  --  match by PCI bus/device/function
+ *
+ *  AdapterInfo has no domain field, so the domain argument is accepted
+ *  but ignored. Matching on bus/device/function is what lets two
+ *  identical AMD GPUs (same vendor+device) be told apart; falling back
+ *  to adl_find_by_pci would otherwise always return adapter 0.
+ * ------------------------------------------------------------------ */
+
+int adl_find_by_pci_topology(uint32_t domain, uint32_t bus,
+                             uint32_t device, uint32_t function,
+                             int *adl_index)
+{
+    int i;
+    (void)domain;  /* ADL AdapterInfo does not expose the PCI domain */
+    if (g_init_ok <= 0 || !g_adapters) return -1;
+
+    for (i = 0; i < g_num_adapters; i++) {
+        if ((uint32_t)g_adapters[i].iBusNumber      == bus &&
+            (uint32_t)g_adapters[i].iDeviceNumber   == device &&
+            (uint32_t)g_adapters[i].iFunctionNumber == function) {
+            *adl_index = i;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* ------------------------------------------------------------------
  *  Query helpers  --  try OverdriveN first, fall back to Overdrive5/6
  * ------------------------------------------------------------------ */
 

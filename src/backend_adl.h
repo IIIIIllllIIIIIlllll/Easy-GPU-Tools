@@ -22,6 +22,15 @@ int adl_find_by_name(const char *name, int *adl_index);
  * Returns 0 and sets *adl_index on success, -1 if not found. */
 int adl_find_by_pci(uint32_t vendor_id, uint32_t device_id, int *adl_index);
 
+/* Find an ADL adapter by PCI bus topology (domain:bus:device.function).
+ * ADL AdapterInfo has no domain field, so domain is accepted but ignored;
+ * matching is on bus/device/function. Needed to distinguish multiple
+ * identical AMD GPUs (same vendor+device, different PCI slot).
+ * Returns 0 and sets *adl_index on success, -1 if not found. */
+int adl_find_by_pci_topology(uint32_t domain, uint32_t bus,
+                             uint32_t device, uint32_t function,
+                             int *adl_index);
+
 /* ADL2_OverdriveN_Temperature_Get / ADL_Overdrive5_Temperature_Get.
  * Returns temperature in millidegrees Celsius. 0 on success, -1 on failure. */
 int adl_get_temperature(int adapter_index, int *temp_milli_c);
@@ -55,6 +64,9 @@ static inline int adl_find_by_name(const char *n, int *i)
     { (void)n; (void)i; return -1; }
 static inline int adl_find_by_pci(uint32_t v, uint32_t d, int *i)
     { (void)v; (void)d; (void)i; return -1; }
+static inline int adl_find_by_pci_topology(uint32_t dom, uint32_t b,
+                                           uint32_t d, uint32_t f, int *i)
+    { (void)dom; (void)b; (void)d; (void)f; (void)i; return -1; }
 static inline int adl_get_temperature(int idx, int *t)
     { (void)idx; (void)t; return -1; }
 static inline int adl_get_fan_speed(int idx, int *r, int *p)

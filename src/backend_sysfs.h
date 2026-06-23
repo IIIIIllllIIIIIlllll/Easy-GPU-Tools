@@ -30,6 +30,14 @@ void sysfs_shutdown(void);
 int sysfs_find_by_vendor_device(int vendor_id, int device_id,
                                 int *gpu_index);
 
+/* Match a Vulkan physical device by PCI bus topology
+ * (domain:bus:device.function). Needed to distinguish multiple identical
+ * AMD GPUs (same vendor+device, different PCI slot).
+ * Returns 0 and sets *gpu_index on success, -1 if not found. */
+int sysfs_find_by_pci_topology(uint32_t domain, uint32_t bus,
+                               uint32_t device, uint32_t function,
+                               int *gpu_index);
+
 /* GPU edge temperature in millidegrees Celsius. 0 on success. */
 int sysfs_get_temperature(int idx, int *milli_c);
 
@@ -61,6 +69,9 @@ static inline int  sysfs_init(void) { return -1; }
 static inline void sysfs_shutdown(void) {}
 static inline int  sysfs_find_by_vendor_device(int v, int d, int *i)
     { (void)v; (void)d; (void)i; return -1; }
+static inline int  sysfs_find_by_pci_topology(uint32_t dom, uint32_t b,
+                                              uint32_t d, uint32_t f, int *i)
+    { (void)dom; (void)b; (void)d; (void)f; (void)i; return -1; }
 static inline int  sysfs_get_temperature(int i, int *t)
     { (void)i; (void)t; return -1; }
 static inline int  sysfs_get_utilization(int i, int *p)

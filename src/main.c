@@ -250,8 +250,16 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
     else if (props.vendorID == 0x1002) {
 #if defined(_WIN32)
         int adl_idx;
-        if (adl_find_by_pci(props.vendorID, props.deviceID, &adl_idx) == 0 ||
-            adl_find_by_name(props.deviceName, &adl_idx) == 0) {
+        /* Prefer PCI topology so two identical AMD GPUs don't collapse
+         * onto adapter 0; fall back to vendor/device then name. */
+        if (adl_find_by_pci_topology(pci_props.pciDomain, pci_props.pciBus,
+                                     pci_props.pciDevice, pci_props.pciFunction,
+                                     &adl_idx) != 0 &&
+            adl_find_by_pci(props.vendorID, props.deviceID, &adl_idx) != 0 &&
+            adl_find_by_name(props.deviceName, &adl_idx) != 0) {
+            adl_idx = -1;
+        }
+        if (adl_idx >= 0) {
             strncpy(info->sensor_backend, "ADL", sizeof(info->sensor_backend) - 1);
 
             int t;
@@ -291,8 +299,16 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
         }
 #elif defined(__linux__)
         int s_idx;
-        if (sysfs_find_by_vendor_device((int)props.vendorID,
-                                        (int)props.deviceID, &s_idx) == 0) {
+        /* Prefer PCI topology so two identical AMD GPUs don't collapse
+         * onto card0; fall back to vendor/device. */
+        if (sysfs_find_by_pci_topology(pci_props.pciDomain, pci_props.pciBus,
+                                       pci_props.pciDevice, pci_props.pciFunction,
+                                       &s_idx) != 0 &&
+            sysfs_find_by_vendor_device((int)props.vendorID,
+                                        (int)props.deviceID, &s_idx) != 0) {
+            s_idx = -1;
+        }
+        if (s_idx >= 0) {
             strncpy(info->sensor_backend, "sysfs", sizeof(info->sensor_backend) - 1);
 
             int temp;
@@ -1079,9 +1095,24 @@ static int do_output(int argc, char *argv[],
 
 #ifdef _WIN32
             if (props.vendorID == 0x1002) {
-                int adl_idx;
+                int adl_idx = -1;
+                VkPhysicalDeviceProperties2 amd_props2 = {0};
+                VkPhysicalDevicePCIBusInfoPropertiesEXT amd_pci = {0};
+                amd_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                amd_props2.pNext = &amd_pci;
+                amd_pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+                vkGetPhysicalDeviceProperties2(phys_devices[i], &amd_props2);
+
                 printf("\n  --- AMD Dynamic Info (ADL) ---\n");
-                if (adl_find_by_name(props.deviceName, &adl_idx) == 0) {
+                /* Prefer PCI topology so two identical AMD GPUs don't
+                 * collapse onto adapter 0; fall back to name. */
+                if (adl_find_by_pci_topology(amd_pci.pciDomain, amd_pci.pciBus,
+                                             amd_pci.pciDevice, amd_pci.pciFunction,
+                                             &adl_idx) != 0 &&
+                    adl_find_by_name(props.deviceName, &adl_idx) != 0) {
+                    adl_idx = -1;
+                }
+                if (adl_idx >= 0) {
                     int t, rpm, pct, eng, mem_clk, act, lvl;
 
                     if (adl_get_temperature(adl_idx, &t) == 0)
@@ -1128,10 +1159,25 @@ static int do_output(int argc, char *argv[],
 
 #ifdef __linux__
             if (props.vendorID == 0x1002) {
-                int s_idx;
+                int s_idx = -1;
+                VkPhysicalDeviceProperties2 amd_props2 = {0};
+                VkPhysicalDevicePCIBusInfoPropertiesEXT amd_pci = {0};
+                amd_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                amd_props2.pNext = &amd_pci;
+                amd_pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+                vkGetPhysicalDeviceProperties2(phys_devices[i], &amd_props2);
+
                 printf("\n  --- AMD Dynamic Info (sysfs) ---\n");
-                if (sysfs_find_by_vendor_device(
-                        (int)props.vendorID, (int)props.deviceID, &s_idx) == 0) {
+                /* Prefer PCI topology so two identical AMD GPUs don't
+                 * collapse onto card0; fall back to vendor/device. */
+                if (sysfs_find_by_pci_topology(amd_pci.pciDomain, amd_pci.pciBus,
+                                               amd_pci.pciDevice, amd_pci.pciFunction,
+                                               &s_idx) != 0 &&
+                    sysfs_find_by_vendor_device(
+                        (int)props.vendorID, (int)props.deviceID, &s_idx) != 0) {
+                    s_idx = -1;
+                }
+                if (s_idx >= 0) {
                     int temp, util, core_mhz, mem_mhz, power;
 
                     if (sysfs_get_temperature(s_idx, &temp) == 0)
