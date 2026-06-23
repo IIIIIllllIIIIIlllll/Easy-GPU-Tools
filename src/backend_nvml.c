@@ -41,17 +41,25 @@ typedef enum {
     NVML_ECC_PENDING  = 2
 } nvmlEnableState_t;  /* 0 = disabled, 1 = enabled */
 
+/* Must match the real nvmlPciInfo_t layout from nvml.h.
+ * The field order below was verified empirically against driver 595 on
+ * Linux by dumping raw bytes: busIdLegacy comes FIRST (offset 0), then
+ * the integer PCI fields, then busId. Putting busIdLegacy after the
+ * integers (as an earlier revision did) made domain/bus/device read the
+ * ASCII bytes of the bus-id string, so PCI matching always failed and
+ * every Vulkan GPU fell back to NVML device 0 -- identical sensor data
+ * on all cards. NVML has no PCI function field (always 0 for a GPU). */
+#define NVML_DEVICE_PCI_BUS_ID_BUFFER_V2_SIZE 16
+#define NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE    32
+
 typedef struct {
-    unsigned int  version;
-    char          busIdLegacy[16];
-    unsigned int  domain;
-    unsigned int  bus;
-    unsigned int  device;
-    unsigned int  function;
-    unsigned int  pciDeviceId;
-    unsigned int  pciSubSystemId;
-    char          busId[32];
-    /* more fields we don't use */
+    char          busIdLegacy[NVML_DEVICE_PCI_BUS_ID_BUFFER_V2_SIZE]; /* offset 0  */
+    unsigned int  domain;                                              /* offset 16 */
+    unsigned int  bus;                                                 /* offset 20 */
+    unsigned int  device;                                              /* offset 24 */
+    unsigned int  pciDeviceId;                                         /* offset 28 */
+    unsigned int  pciSubSystemId;                                      /* offset 32 */
+    char          busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];           /* offset 36 */
 } nvmlPciInfo_t;
 
 typedef struct {
@@ -76,6 +84,19 @@ typedef struct {
     unsigned long long used;
 } nvmlMemory_t;
 
+/* Memory info v2 -- field order matches nvml.h nvmlMemory_v2_st:
+ *   version, [pad], total, reserved, free, used
+ * Unlike v1, 'used' is allocated memory ONLY (excludes driver-reserved),
+ * matching what nvidia-smi reports. v1 'used' = reserved + allocated. */
+typedef struct {
+    unsigned int       version;    /* offset 0  -- set by caller to NVML version */
+    unsigned int       _pad;       /* offset 4  -- alignment (8-byte for ull) */
+    unsigned long long total;      /* offset 8  */
+    unsigned long long reserved;   /* offset 16 */
+    unsigned long long free;       /* offset 24 */
+    unsigned long long used;       /* offset 32 -- allocated only */
+} nvmlMemory_v2_t;
+
 /* ------------------------------------------------------------------
  *  Function pointer typedefs
  * ------------------------------------------------------------------ */
@@ -92,6 +113,7 @@ typedef int (*PFN_nvmlDeviceGetClockInfo)(nvmlDevice_t, int, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetPowerUsage)(nvmlDevice_t, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetPowerManagementLimit)(nvmlDevice_t, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t*);
+typedef int (*PFN_nvmlDeviceGetMemoryInfo_v2)(nvmlDevice_t, nvmlMemory_v2_t*);
 typedef int (*PFN_nvmlDeviceGetFanSpeed)(nvmlDevice_t, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetPerformanceState)(nvmlDevice_t, int*);
 typedef int (*PFN_nvmlDeviceGetEccMode)(nvmlDevice_t, int*, int*);
@@ -108,9 +130,20 @@ static HMODULE g_lib = NULL;
 #define FREE_LIB(l)  FreeLibrary((HMODULE)(l))
 #else
 static void *g_lib = NULL;
-#define LOAD_LIB()   dlopen("libnvidia-ml.so", RTLD_LAZY)
 #define GET_FN(l, n) dlsym((l), n)
 #define FREE_LIB(l)  dlclose((l))
+
+/* NVIDIA driver packages ship only the versioned soname libnvidia-ml.so.1;
+ * the unversioned libnvidia-ml.so symlink is provided by -dev packages and
+ * is usually absent on runtime-only installs. Try the dev symlink first
+ * (so dev boxes keep working), then fall back to the canonical soname. */
+static void *nvml_load_lib(void)
+{
+    void *lib = dlopen("libnvidia-ml.so", RTLD_LAZY);
+    if (!lib) lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+    return lib;
+}
+#define LOAD_LIB() nvml_load_lib()
 #endif
 
 static int g_init_ok = 0;
@@ -127,6 +160,7 @@ static PFN_nvmlDeviceGetClockInfo            pfn_GetClock = NULL;
 static PFN_nvmlDeviceGetPowerUsage           pfn_GetPower = NULL;
 static PFN_nvmlDeviceGetPowerManagementLimit pfn_GetPowerLimit = NULL;
 static PFN_nvmlDeviceGetMemoryInfo           pfn_GetMem = NULL;
+static PFN_nvmlDeviceGetMemoryInfo_v2        pfn_GetMem2 = NULL;
 static PFN_nvmlDeviceGetFanSpeed             pfn_GetFan = NULL;
 static PFN_nvmlDeviceGetPerformanceState     pfn_GetPState = NULL;
 static PFN_nvmlDeviceGetEccMode              pfn_GetEcc = NULL;
@@ -174,8 +208,13 @@ int nvml_init(void)
         !RESOLVE(pfn_GetCount, "nvmlDeviceGetCount")) goto fail;
     if (!RESOLVE(pfn_GetHandleByIndex, "nvmlDeviceGetHandleByIndex_v2") &&
         !RESOLVE(pfn_GetHandleByIndex, "nvmlDeviceGetHandleByIndex")) goto fail;
-    /* GetPciInfo is needed for matching identical GPU models */
-    RESOLVE(pfn_GetPciInfo, "nvmlDeviceGetPciInfo_v3");
+    /* GetPciInfo is needed for matching identical GPU models.
+     * v3 is canonical since ~2014; fall back to v2/v1 for older drivers. */
+    if (!RESOLVE(pfn_GetPciInfo, "nvmlDeviceGetPciInfo_v3") &&
+        !RESOLVE(pfn_GetPciInfo, "nvmlDeviceGetPciInfo_v2") &&
+        !RESOLVE(pfn_GetPciInfo, "nvmlDeviceGetPciInfo")) {
+        /* PCI matching disabled; multi-GPU may collapse to device 0. */
+    }
 
     RESOLVE(pfn_GetTemp,      "nvmlDeviceGetTemperature");
     RESOLVE(pfn_GetUtil,      "nvmlDeviceGetTotalUtilization");
@@ -184,6 +223,7 @@ int nvml_init(void)
     RESOLVE(pfn_GetPower,     "nvmlDeviceGetPowerUsage");
     RESOLVE(pfn_GetPowerLimit,"nvmlDeviceGetPowerManagementLimit");
     RESOLVE(pfn_GetMem,       "nvmlDeviceGetMemoryInfo");
+    RESOLVE(pfn_GetMem2,      "nvmlDeviceGetMemoryInfo_v2");
     RESOLVE(pfn_GetFan,       "nvmlDeviceGetFanSpeed");
     RESOLVE(pfn_GetPState,    "nvmlDeviceGetPerformanceState");
     RESOLVE(pfn_GetEcc,       "nvmlDeviceGetEccMode");
@@ -198,7 +238,6 @@ int nvml_init(void)
 
     for (i = 0; i < g_num_devices; i++) {
         nvmlPciInfo_t pci = {0};
-        pci.version = sizeof(nvmlPciInfo_t);
         g_devices[i] = NULL;
         r = pfn_GetHandleByIndex(i, &g_devices[i]);
         if (r != NVML_SUCCESS) continue;
@@ -206,7 +245,7 @@ int nvml_init(void)
             g_pci_info[i].domain   = pci.domain;
             g_pci_info[i].bus      = pci.bus;
             g_pci_info[i].device   = pci.device;
-            g_pci_info[i].function = pci.function;
+            g_pci_info[i].function = 0;  /* GPU is always function 0; NVML has no function field */
             g_pci_info[i].valid    = 1;
         }
     }
@@ -396,13 +435,30 @@ int nvml_get_power(int idx, int *usage_w, int *limit_w)
 
 int nvml_get_memory(int idx, unsigned int *used_mb, unsigned int *total_mb)
 {
-    nvmlMemory_t m = {0};
     CHECK(idx);
-    if (!pfn_GetMem) return -1;
-    if (pfn_GetMem(g_devices[idx], &m) != NVML_SUCCESS) return -1;
-    *used_mb  = (unsigned int)(m.used  / (1024ULL * 1024ULL));
-    *total_mb = (unsigned int)(m.total / (1024ULL * 1024ULL));
-    return 0;
+
+    /* Prefer v2: 'used' is allocated memory only (matches nvidia-smi).
+     * v1 'used' = reserved + allocated, which over-reports on idle GPUs. */
+    if (pfn_GetMem2) {
+        nvmlMemory_v2_t m2 = {0};
+        m2.version = (unsigned int)sizeof(nvmlMemory_v2_t) | (2U << 24);
+        if (pfn_GetMem2(g_devices[idx], &m2) == NVML_SUCCESS && m2.total > 0) {
+            *used_mb  = (unsigned int)(m2.used  / (1024ULL * 1024ULL));
+            *total_mb = (unsigned int)(m2.total / (1024ULL * 1024ULL));
+            return 0;
+        }
+    }
+
+    /* Fallback: v1 (used = reserved + allocated) */
+    if (pfn_GetMem) {
+        nvmlMemory_t m = {0};
+        if (pfn_GetMem(g_devices[idx], &m) == NVML_SUCCESS) {
+            *used_mb  = (unsigned int)(m.used  / (1024ULL * 1024ULL));
+            *total_mb = (unsigned int)(m.total / (1024ULL * 1024ULL));
+            return 0;
+        }
+    }
+    return -1;
 }
 
 int nvml_get_fan(int idx, int *percent)
