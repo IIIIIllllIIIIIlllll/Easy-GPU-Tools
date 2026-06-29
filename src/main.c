@@ -12,6 +12,7 @@
 #include "backend_adl.h"
 #include "backend_sysfs.h"
 #include "backend_nvml.h"
+#include "backend_intel.h"
 #include "backend_sysinfo.h"
 #include "backend_vulkan.h"
 
@@ -361,6 +362,124 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
                         info->mem_total_bytes = st;
                     }
                 }
+            }
+        }
+#endif
+    }
+    /* -- Intel: IGCL (Windows) / sysfs (Linux) ----------------------- */
+    else if (props.vendorID == 0x8086) {
+#if defined(_WIN32)
+        int intel_idx;
+        /* Prefer PCI topology so two identical Intel GPUs don't collapse
+         * onto adapter 0; fall back to vendor/device. */
+        if (intel_find_by_pci_topology(pci_props.pciDomain, pci_props.pciBus,
+                                       pci_props.pciDevice, pci_props.pciFunction,
+                                       &intel_idx) != 0 &&
+            intel_find_by_pci(props.vendorID, props.deviceID, &intel_idx) != 0) {
+            intel_idx = -1;
+        }
+        if (intel_idx >= 0) {
+            strncpy(info->sensor_backend, "IGCL", sizeof(info->sensor_backend) - 1);
+
+            int t;
+            if (intel_get_temperature(intel_idx, &t) == 0)
+                info->temperature_milli_c = t;
+
+            int gpu_pct, mem_pct;
+            if (intel_get_utilization(intel_idx, &gpu_pct, &mem_pct) == 0) {
+                info->utilization_gpu_pct = gpu_pct;
+                if (mem_pct >= 0)
+                    info->utilization_mem_pct = mem_pct;
+            }
+
+            int core_mhz, mem_clk;
+            if (intel_get_clocks(intel_idx, &core_mhz, &mem_clk) == 0) {
+                info->core_clock_mhz = core_mhz;
+                if (mem_clk >= 0)
+                    info->mem_clock_mhz = mem_clk;
+            }
+
+            int pwr_usage, pwr_limit;
+            if (intel_get_power(intel_idx, &pwr_usage, &pwr_limit) == 0) {
+                if (pwr_usage >= 0)
+                    info->power_milliwatts = pwr_usage;
+                if (pwr_limit >= 0)
+                    info->power_limit_milliwatts = pwr_limit;
+            }
+
+            int rpm, pct;
+            if (intel_get_fan(intel_idx, &rpm, &pct) == 0) {
+                if (rpm >= 0)
+                    info->fan_speed_rpm = rpm;
+                if (pct >= 0)
+                    info->fan_speed_pct = pct;
+            }
+
+            uint64_t mem_used, mem_total;
+            if (intel_get_memory(intel_idx, &mem_used, &mem_total) == 0) {
+                info->mem_used_bytes  = mem_used;
+                info->mem_total_bytes = mem_total;
+            }
+
+            /* memory: for iGPUs IGCL may only report a small segment;
+             * use the Vulkan-visible total like we do for AMD APUs. */
+            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                uint64_t vt = info->dedicated_vram_bytes + info->shared_ram_bytes;
+                if (vt > info->mem_total_bytes)
+                    info->mem_total_bytes = vt;
+            }
+        }
+#elif defined(__linux__)
+        int s_idx;
+        /* Prefer PCI topology so two identical Intel GPUs don't collapse
+         * onto card0; fall back to vendor/device. */
+        if (sysfs_find_by_pci_topology(pci_props.pciDomain, pci_props.pciBus,
+                                       pci_props.pciDevice, pci_props.pciFunction,
+                                       &s_idx) != 0 &&
+            sysfs_find_by_vendor_device((int)props.vendorID,
+                                        (int)props.deviceID, &s_idx) != 0) {
+            s_idx = -1;
+        }
+        if (s_idx >= 0) {
+            strncpy(info->sensor_backend, "sysfs", sizeof(info->sensor_backend) - 1);
+
+            int temp;
+            if (sysfs_get_temperature(s_idx, &temp) == 0)
+                info->temperature_milli_c = temp;
+
+            int util;
+            if (sysfs_get_intel_utilization(s_idx, &util) == 0)
+                info->utilization_gpu_pct = util;
+
+            int core_mhz, mm_mhz;
+            if (sysfs_get_intel_clocks(s_idx, &core_mhz, &mm_mhz) == 0) {
+                info->core_clock_mhz = core_mhz;
+                if (mm_mhz >= 0)
+                    info->mem_clock_mhz = mm_mhz;
+            }
+
+            int power;
+            if (sysfs_get_intel_power(s_idx, &power) == 0)
+                info->power_milliwatts = power;
+
+            int rpm, pct;
+            if (sysfs_get_fan(s_idx, &rpm, &pct) == 0) {
+                info->fan_speed_rpm = rpm;
+                if (pct >= 0)
+                    info->fan_speed_pct = pct;
+            }
+
+            uint64_t mem_used_b, mem_total_b;
+            if (sysfs_get_intel_memory(s_idx, &mem_used_b, &mem_total_b) == 0) {
+                info->mem_used_bytes  = mem_used_b;
+                info->mem_total_bytes = mem_total_b;
+            }
+
+            /* memory: for iGPUs, use Vulkan-visible total (UMA). */
+            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                uint64_t vt = info->dedicated_vram_bytes + info->shared_ram_bytes;
+                if (vt > info->mem_total_bytes)
+                    info->mem_total_bytes = vt;
             }
         }
 #endif
@@ -1018,7 +1137,7 @@ static int do_output(int argc, char *argv[],
     if (!cpu_mode && !ram_mode && !json_mode && instance != VK_NULL_HANDLE) {
         uint32_t total = 0;
 
-        printf("===== GPU Information (Vulkan + ADL/sysfs + NVML) =====\n");
+        printf("===== GPU Information (Vulkan + ADL/IGCL/sysfs + NVML) =====\n");
         printf("(Plain C -- cross-platform + dynamic info)\n");
         printf("=======================================================\n\n");
 
@@ -1320,6 +1439,160 @@ static int do_output(int argc, char *argv[],
                 }
             }
 
+#ifdef _WIN32
+            if (props.vendorID == 0x8086) {
+                int intel_idx = -1;
+                VkPhysicalDeviceProperties2 intel_props2 = {0};
+                VkPhysicalDevicePCIBusInfoPropertiesEXT intel_pci = {0};
+                intel_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                intel_props2.pNext = &intel_pci;
+                intel_pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+                vkGetPhysicalDeviceProperties2(phys_devices[i], &intel_props2);
+
+                printf("\n  --- Intel Dynamic Info (IGCL) ---\n");
+                if (intel_find_by_pci_topology(intel_pci.pciDomain, intel_pci.pciBus,
+                                               intel_pci.pciDevice, intel_pci.pciFunction,
+                                               &intel_idx) != 0 &&
+                    intel_find_by_pci(props.vendorID, props.deviceID, &intel_idx) != 0) {
+                    intel_idx = -1;
+                }
+                if (intel_idx >= 0) {
+                    int t, gpu_pct, mem_pct, core_mhz, mem_clk;
+                    int pwr_usage, pwr_limit, rpm, pct;
+                    uint64_t mem_used, mem_total;
+
+                    if (intel_get_temperature(intel_idx, &t) == 0)
+                        printf("  GPU Temperature : %.1f C\n", t / 1000.0);
+                    else
+                        printf("  GPU Temperature : N/A\n");
+
+                    if (intel_get_utilization(intel_idx, &gpu_pct, &mem_pct) == 0) {
+                        printf("  GPU Utilization : %d%%\n", gpu_pct);
+                        if (mem_pct >= 0)
+                            printf("  Memory Util.    : %d%%\n", mem_pct);
+                    } else {
+                        printf("  GPU Utilization : N/A\n");
+                    }
+
+                    if (intel_get_clocks(intel_idx, &core_mhz, &mem_clk) == 0) {
+                        printf("  GPU Clock       : %d MHz\n", core_mhz);
+                        if (mem_clk >= 0)
+                            printf("  Memory Clock    : %d MHz\n", mem_clk);
+                        else
+                            printf("  Memory Clock    : N/A\n");
+                    } else {
+                        printf("  GPU Clock       : N/A\n");
+                        printf("  Memory Clock    : N/A\n");
+                    }
+
+                    if (intel_get_power(intel_idx, &pwr_usage, &pwr_limit) == 0) {
+                        if (pwr_usage >= 0 && pwr_limit >= 0)
+                            printf("  Power           : %.2f W / %.2f W\n",
+                                   pwr_usage / 1000.0, pwr_limit / 1000.0);
+                        else if (pwr_usage >= 0)
+                            printf("  Power           : %.2f W\n", pwr_usage / 1000.0);
+                        else
+                            printf("  Power           : N/A\n");
+                    } else {
+                        printf("  Power           : N/A\n");
+                    }
+
+                    if (intel_get_fan(intel_idx, &rpm, &pct) == 0) {
+                        if (rpm >= 0 && pct >= 0)
+                            printf("  Fan Speed       : %d%% (%d RPM)\n", pct, rpm);
+                        else if (pct >= 0)
+                            printf("  Fan Speed       : %d%%\n", pct);
+                        else if (rpm >= 0)
+                            printf("  Fan Speed       : %d RPM\n", rpm);
+                    } else {
+                        printf("  Fan Speed       : N/A\n");
+                    }
+
+                    if (intel_get_memory(intel_idx, &mem_used, &mem_total) == 0) {
+                        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                            uint64_t vt = dedicated_vram + shared_ram;
+                            if (vt > mem_total)
+                                mem_total = vt;
+                        }
+                        printf("  Memory Usage    : %llu / %llu MB\n",
+                               (unsigned long long)(mem_used / (1024ULL * 1024ULL)),
+                               (unsigned long long)(mem_total / (1024ULL * 1024ULL)));
+                    } else {
+                        printf("  Memory Usage    : N/A\n");
+                    }
+                } else {
+                    printf("  (could not match IGCL adapter)\n");
+                }
+            }
+#endif
+
+#ifdef __linux__
+            if (props.vendorID == 0x8086) {
+                int s_idx = -1;
+                VkPhysicalDeviceProperties2 intel_props2 = {0};
+                VkPhysicalDevicePCIBusInfoPropertiesEXT intel_pci = {0};
+                intel_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                intel_props2.pNext = &intel_pci;
+                intel_pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+                vkGetPhysicalDeviceProperties2(phys_devices[i], &intel_props2);
+
+                printf("\n  --- Intel Dynamic Info (sysfs) ---\n");
+                if (sysfs_find_by_pci_topology(intel_pci.pciDomain, intel_pci.pciBus,
+                                               intel_pci.pciDevice, intel_pci.pciFunction,
+                                               &s_idx) != 0 &&
+                    sysfs_find_by_vendor_device(
+                        (int)props.vendorID, (int)props.deviceID, &s_idx) != 0) {
+                    s_idx = -1;
+                }
+                if (s_idx >= 0) {
+                    int temp, util, core_mhz, mem_mhz, power;
+
+                    if (sysfs_get_temperature(s_idx, &temp) == 0)
+                        printf("  GPU Temperature : %.1f C\n", temp / 1000.0);
+                    else
+                        printf("  GPU Temperature : N/A\n");
+
+                    if (sysfs_get_intel_utilization(s_idx, &util) == 0)
+                        printf("  GPU Utilization : %d%%\n", util);
+                    else
+                        printf("  GPU Utilization : N/A\n");
+
+                    if (sysfs_get_intel_clocks(s_idx, &core_mhz, &mem_mhz) == 0) {
+                        printf("  GPU Clock       : %d MHz\n", core_mhz);
+                        if (mem_mhz >= 0)
+                            printf("  Memory Clock    : %d MHz\n", mem_mhz);
+                        else
+                            printf("  Memory Clock    : N/A\n");
+                    } else {
+                        printf("  GPU Clock       : N/A\n");
+                        printf("  Memory Clock    : N/A\n");
+                    }
+
+                    if (sysfs_get_intel_power(s_idx, &power) == 0)
+                        printf("  Power           : %.2f W\n", power / 1000.0);
+                    else
+                        printf("  Power           : N/A\n");
+
+                    {
+                        uint64_t mem_used_b, mem_total_b;
+                        if (sysfs_get_intel_memory(s_idx, &mem_used_b, &mem_total_b) == 0) {
+                            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                                uint64_t vt = dedicated_vram + shared_ram;
+                                if (vt > mem_total_b)
+                                    mem_total_b = vt;
+                            }
+                            printf("  Memory Usage    : %llu / %llu MB\n",
+                                   (unsigned long long)(mem_used_b / (1024ULL * 1024ULL)),
+                                   (unsigned long long)(mem_total_b / (1024ULL * 1024ULL)));
+                        } else
+                            printf("  Memory Usage    : N/A\n");
+                    }
+                } else {
+                    printf("  (could not match /sys/class/drm/ device)\n");
+                }
+            }
+#endif
+
             printf("\n");
             total++;
         }
@@ -1531,6 +1804,7 @@ int main(int argc, char *argv[])
     if (instance != VK_NULL_HANDLE) {
 #ifdef _WIN32
         adl_init();
+        intel_init();
 #endif
 #ifdef __linux__
         sysfs_init();
@@ -1566,11 +1840,82 @@ int main(int argc, char *argv[])
 
         {
             uint32_t keep = 0;
+            /* Dedup cache: PCI topology + identity for already-kept
+             * devices.  The Vulkan loader may enumerate the same
+             * physical GPU multiple times when multiple ICD manifest
+             * files register it (common with Intel driver update
+             * residues), so we collapse duplicates by PCI address.
+             * Two identical discrete GPUs (e.g. 2x RTX 4090) have
+             * different PCI addresses and are NOT merged. */
+            struct {
+                uint32_t domain, bus, device, function;
+                int      pci_valid;
+                uint32_t vendor_id, device_id;
+                char     name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+            } seen[32];
+            uint32_t s;
+
             for (i = 0; i < device_count; i++) {
+                VkPhysicalDeviceProperties2 props2 = {0};
+                VkPhysicalDevicePCIBusInfoPropertiesEXT pci_props = {0};
                 VkPhysicalDeviceProperties props;
+                int pci_valid, is_dup = 0;
+
                 vkGetPhysicalDeviceProperties(phys_devices[i], &props);
                 if (strstr(props.deviceName, "llvmpipe")) continue;
+
+                /* Query PCI bus info for dedup (same extension already
+                 * used in gpu_collect_info).  If the extension is
+                 * unsupported the struct stays zeroed; a real GPU is
+                 * never at 00:00.0 (that's the host bridge), so
+                 * all-zero safely means "no PCI info available". */
+                props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                props2.pNext = &pci_props;
+                pci_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+                vkGetPhysicalDeviceProperties2(phys_devices[i], &props2);
+
+                pci_valid = (pci_props.pciDomain | pci_props.pciBus |
+                             pci_props.pciDevice | pci_props.pciFunction) != 0;
+
+                for (s = 0; s < keep && s < 32; s++) {
+                    if (pci_valid && seen[s].pci_valid) {
+                        /* Both have PCI info: compare exact topology.
+                         * This is what lets identical discrete GPUs
+                         * survive dedup -- they differ in PCI slot. */
+                        if (seen[s].domain   == pci_props.pciDomain &&
+                            seen[s].bus      == pci_props.pciBus &&
+                            seen[s].device   == pci_props.pciDevice &&
+                            seen[s].function == pci_props.pciFunction) {
+                            is_dup = 1;
+                            break;
+                        }
+                    } else if (!pci_valid && !seen[s].pci_valid) {
+                        /* Neither has PCI info: fall back to
+                         * vendor+device+name identity comparison */
+                        if (seen[s].vendor_id == props.vendorID &&
+                            seen[s].device_id == props.deviceID &&
+                            strcmp(seen[s].name, props.deviceName) == 0) {
+                            is_dup = 1;
+                            break;
+                        }
+                    }
+                }
+
+                if (is_dup) continue;
+
                 if (keep != i) phys_devices[keep] = phys_devices[i];
+                if (keep < 32) {
+                    seen[keep].domain    = pci_props.pciDomain;
+                    seen[keep].bus       = pci_props.pciBus;
+                    seen[keep].device    = pci_props.pciDevice;
+                    seen[keep].function  = pci_props.pciFunction;
+                    seen[keep].pci_valid = pci_valid;
+                    seen[keep].vendor_id = props.vendorID;
+                    seen[keep].device_id = props.deviceID;
+                    strncpy(seen[keep].name, props.deviceName,
+                            sizeof(seen[keep].name) - 1);
+                    seen[keep].name[sizeof(seen[keep].name) - 1] = '\0';
+                }
                 keep++;
             }
             device_count = keep;
@@ -1594,6 +1939,7 @@ int main(int argc, char *argv[])
     nvml_shutdown();
 #ifdef _WIN32
     adl_shutdown();
+    intel_shutdown();
 #endif
 #ifdef __linux__
     sysfs_shutdown();

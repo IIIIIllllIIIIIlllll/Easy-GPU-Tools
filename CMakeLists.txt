@@ -34,6 +34,7 @@ add_executable(gpu-info
     src/main.c
     src/backend_vulkan.c
     src/backend_adl.c
+    src/backend_intel.c
     src/backend_sysfs.c
     src/backend_nvml.c
     src/backend_sysinfo.c

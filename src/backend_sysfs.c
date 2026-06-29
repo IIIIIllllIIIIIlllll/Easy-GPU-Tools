@@ -409,4 +409,157 @@ int sysfs_get_memory(int idx, uint64_t *used_bytes, uint64_t *total_bytes)
     return 0;
 }
 
+/* ------------------------------------------------------------------
+ *  Intel i915 / xe specific queries
+ * ------------------------------------------------------------------ */
+
+int sysfs_get_intel_clocks(int idx, int *core_mhz, int *mem_mhz)
+{
+    char p[PATH_MAX + 128];
+    int val;
+    int ok = 0;
+
+    if (idx < 0 || idx >= g_num_gpus || !g_gpus[idx].valid)
+        return -1;
+
+    *core_mhz = -1;
+    *mem_mhz  = -1;
+
+    /* i915: gt_cur_freq_mhz (current requested) or gt_act_freq_mhz
+     * (actual) -- both already in MHz, no conversion needed. */
+    make_path(p, sizeof(p), g_gpus[idx].dev_path, "gt_cur_freq_mhz");
+    if (TRY_READ(&val, p)) {
+        *core_mhz = val;
+        ok = 1;
+    } else {
+        make_path(p, sizeof(p), g_gpus[idx].dev_path, "gt_act_freq_mhz");
+        if (TRY_READ(&val, p)) {
+            *core_mhz = val;
+            ok = 1;
+        }
+    }
+
+    /* xe driver: tile0/gt0/freq0/cur_freq (in Hz, convert to MHz) */
+    if (!ok) {
+        unsigned long long hz;
+        make_path(p, sizeof(p), g_gpus[idx].dev_path, "tile0/gt0/freq0/cur_freq");
+        if (read_ull(p, &hz) == 0) {
+            *core_mhz = (int)(hz / 1000000ULL);
+            ok = 1;
+        }
+    }
+
+    return ok ? 0 : -1;
+}
+
+int sysfs_get_intel_utilization(int idx, int *percent)
+{
+    char p[PATH_MAX + 64];
+    int val;
+
+    if (idx < 0 || idx >= g_num_gpus || !g_gpus[idx].valid)
+        return -1;
+
+    /* First try gpu_busy_percent (amdgpu-style; future xe may add it). */
+    make_path(p, sizeof(p), g_gpus[idx].dev_path, "gpu_busy_percent");
+    if (TRY_READ(&val, p)) {
+        *percent = val;
+        return 0;
+    }
+
+    /* Fall back to intel-gpu-top (igt-gpu-tools) as a subprocess.
+     * This mirrors the nvidia-smi popen fallback in backend_nvml.c. */
+    {
+        const char *cp = g_gpus[idx].card_path;
+        const char *card_str = strstr(cp, "card");
+        int card_num, found = -1;
+        char cmd[256];
+        FILE *fp;
+        char line[512];
+
+        if (!card_str) return -1;
+        card_num = atoi(card_str + 4);
+
+        snprintf(cmd, sizeof(cmd),
+            "intel-gpu-top -d /dev/dri/card%d -l 1 -s 500 -o - 2>/dev/null",
+            card_num);
+
+        fp = popen(cmd, "r");
+        if (!fp) return -1;
+
+        while (fgets(line, sizeof(line), fp)) {
+            /* Look for the "busy:" line which lists per-engine load.
+             * The render/compute engine (rcs0) is the main GPU utilisation. */
+            if (strstr(line, "busy")) {
+                char *rcs = strstr(line, "rcs0:");
+                if (rcs) {
+                    char *endp;
+                    double v = strtod(rcs + 5, &endp);
+                    if (endp != rcs + 5 && v >= 0.0 && v <= 100.0) {
+                        found = (int)(v + 0.5);
+                        break;
+                    }
+                }
+            }
+        }
+        pclose(fp);
+
+        if (found >= 0) {
+            *percent = found;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int sysfs_get_intel_power(int idx, int *milliwatts)
+{
+    char p[PATH_MAX + 64];
+    unsigned long long val;
+
+    if (idx < 0 || idx >= g_num_gpus || !g_gpus[idx].valid)
+        return -1;
+
+    /* Intel i915 hwmon exposes power1_input (µW), unlike amdgpu which
+     * uses power1_average. */
+    if (g_gpus[idx].hwmon_path[0]) {
+        make_path(p, sizeof(p), g_gpus[idx].hwmon_path, "power1_input");
+        if (read_ull(p, &val) == 0) {
+            *milliwatts = (int)(val / 1000ULL); /* µW -> mW */
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int sysfs_get_intel_memory(int idx, uint64_t *used_bytes, uint64_t *total_bytes)
+{
+    char p[PATH_MAX + 128];
+    unsigned long long val;
+
+    if (idx < 0 || idx >= g_num_gpus || !g_gpus[idx].valid)
+        return -1;
+
+    *used_bytes  = 0;
+    *total_bytes = 0;
+
+    /* xe discrete driver: mem_info_vram_* under tile0/gt0.
+     * Fall back to a flat path for simpler driver layouts. */
+    make_path(p, sizeof(p), g_gpus[idx].dev_path, "tile0/gt0/mem_info_vram_total");
+    if (read_ull(p, &val) != 0) {
+        make_path(p, sizeof(p), g_gpus[idx].dev_path, "mem_info_vram_total");
+        if (read_ull(p, &val) != 0) return -1;
+    }
+    *total_bytes = (uint64_t)val;
+
+    make_path(p, sizeof(p), g_gpus[idx].dev_path, "tile0/gt0/mem_info_vram_used");
+    if (read_ull(p, &val) != 0) {
+        make_path(p, sizeof(p), g_gpus[idx].dev_path, "mem_info_vram_used");
+        if (read_ull(p, &val) != 0) return -1;
+    }
+    *used_bytes = (uint64_t)val;
+
+    return 0;
+}
+
 #endif /* __linux__ */
