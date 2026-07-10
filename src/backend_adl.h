@@ -51,10 +51,28 @@ int adl_get_activity(int adapter_index,
                      int *activity_percent,
                      int *perf_level);
 
-/* ADL_Adapter_MemoryInfo_Get + ADL2_Adapter_VRAMUsage_Get.
+/* ADL2_Adapter_MemoryInfo_Get + ADL2_Adapter_VRAMUsage_Get.
  * Returns used and total VRAM in bytes. 0 on success, -1 on failure. */
 int adl_get_memory(int adapter_index, uint64_t *used_bytes,
                    uint64_t *total_bytes);
+
+/* ADL2_New_QueryPMLogData_Get -- PMLog sensor snapshot.
+ * Returns 0 and fills *out on success, -1 on failure.
+ * This is the telemetry path that works on AMD iGPUs/APUs where
+ * OverdriveN/Overdrive5 return nothing.  The output is indexed
+ * directly by ADL_PMLOG_SENSORS enum values (defined in backend_adl.c).
+ * Returns 0 on success, -1 on failure. */
+int adl_get_pmlog(int adapter_index, void *out);
+
+/* PMLog power -- returns the best available power reading in milliwatts.
+ * Tries ASIC_POWER (sensor 23), then GFX_POWER (30), then APU_POWER (46).
+ * Returns 0 on success, -1 on failure. */
+int adl_get_pmlog_power(int adapter_index, int *power_milliwatts);
+
+/* PMLog fan -- returns fan RPM.  Works on dGPUs with fans;
+ * iGPUs/APUs typically have no fan sensor (returns -1).
+ * Returns 0 on success, -1 on failure. */
+int adl_get_pmlog_fan(int adapter_index, int *rpm, int *percent);
 
 #else  /* Linux / non-Windows stubs */
 
@@ -75,6 +93,12 @@ static inline int adl_get_activity(int idx, int *e, int *m, int *a, int *l)
     { (void)idx; (void)e; (void)m; (void)a; (void)l; return -1; }
 static inline int adl_get_memory(int idx, uint64_t *u, uint64_t *t)
     { (void)idx; (void)u; (void)t; return -1; }
+static inline int adl_get_pmlog(int idx, void *out)
+    { (void)idx; (void)out; return -1; }
+static inline int adl_get_pmlog_power(int idx, int *p)
+    { (void)idx; (void)p; return -1; }
+static inline int adl_get_pmlog_fan(int idx, int *r, int *p)
+    { (void)idx; (void)r; (void)p; return -1; }
 
 #endif /* _WIN32 */
 

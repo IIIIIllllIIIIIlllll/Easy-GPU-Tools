@@ -15,6 +15,7 @@
 #include "backend_intel.h"
 #include "backend_sysinfo.h"
 #include "backend_vulkan.h"
+#include "backend_winmem.h"
 
 /* Redirect Vulkan API calls through dynamically loaded function pointers */
 #define vkCreateInstance                vulkan_CreateInstance
@@ -151,6 +152,7 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
 {
     VkPhysicalDeviceProperties2 props2 = {0};
     VkPhysicalDevicePCIBusInfoPropertiesEXT pci_props = {0};
+    VkPhysicalDeviceIDProperties id_props = {0};
     VkPhysicalDeviceMemoryProperties mem;
 
     gpu_init_info(info);
@@ -158,10 +160,26 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
     props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     props2.pNext = &pci_props;
     pci_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+    pci_props.pNext = &id_props;
+    id_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
     vkGetPhysicalDeviceProperties2(device, &props2);
     vkGetPhysicalDeviceMemoryProperties(device, &mem);
 
     VkPhysicalDeviceProperties props = props2.properties;
+
+    /* Extract Windows LUID for PDH performance-counter matching */
+    uint32_t luid_low  = 0;
+    uint32_t luid_high = 0;
+    if (id_props.deviceLUIDValid) {
+        luid_low  = ((uint32_t)id_props.deviceLUID[0])       |
+                    ((uint32_t)id_props.deviceLUID[1] << 8)  |
+                    ((uint32_t)id_props.deviceLUID[2] << 16) |
+                    ((uint32_t)id_props.deviceLUID[3] << 24);
+        luid_high = ((uint32_t)id_props.deviceLUID[4])       |
+                    ((uint32_t)id_props.deviceLUID[5] << 8)  |
+                    ((uint32_t)id_props.deviceLUID[6] << 16) |
+                    ((uint32_t)id_props.deviceLUID[7] << 24);
+    }
 
     /* identification */
     strncpy(info->device_name, props.deviceName, sizeof(info->device_name) - 1);
@@ -271,6 +289,9 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
             if (adl_get_fan_speed(adl_idx, &rpm, &pct) == 0) {
                 info->fan_speed_rpm = rpm;
                 info->fan_speed_pct = pct;
+            } else if (adl_get_pmlog_fan(adl_idx, &rpm, &pct) == 0) {
+                if (rpm > 0) info->fan_speed_rpm = rpm;
+                if (pct > 0) info->fan_speed_pct = pct;
             }
 
             int eng, mem_clk, act, lvl;
@@ -279,9 +300,19 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
                 info->core_clock_mhz      = eng / 100;
                 info->mem_clock_mhz       = mem_clk / 100;
                 info->perf_state          = lvl;
-            } else {
-                /* clocks remain unavailable when OverdriveN/OD5 fail */
-                (void)adl_idx;
+            } else if (id_props.deviceLUIDValid) {
+                /* AMD iGPU/APU fallback: Windows PDH GPU Engine counters */
+                int util;
+                if (winmem_get_utilization(luid_low, luid_high, &util) == 0) {
+                    info->utilization_gpu_pct = util;
+                }
+            }
+
+            /* PMLog power -- works on iGPUs/APUs where Overdrive power doesn't */
+            {
+                int pwr;
+                if (adl_get_pmlog_power(adl_idx, &pwr) == 0 && pwr > 0)
+                    info->power_milliwatts = pwr;
             }
 
             uint64_t vram_used, vram_total;
@@ -291,11 +322,22 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
             }
 
             /* memory: for AMD iGPUs ADL only reports the small
-             * hardware-reserved segment; use the Vulkan-visible total. */
+             * hardware-reserved segment; use the Vulkan-visible total.
+             * Additionally, supplement with PDH Windows counters which
+             * provide the true shared usage + total committed budget. */
             if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
                 uint64_t vt = info->dedicated_vram_bytes + info->shared_ram_bytes;
                 if (vt > info->mem_total_bytes)
                     info->mem_total_bytes = vt;
+
+                if (id_props.deviceLUIDValid) {
+                    uint64_t ded = 0, sha = 0, tot = 0;
+                    if (winmem_get_memory(luid_low, luid_high,
+                                          &ded, &sha, &tot) == 0) {
+                        info->mem_used_bytes  = sha + ded;
+                        info->mem_total_bytes = tot;
+                    }
+                }
             }
         }
 #elif defined(__linux__)
@@ -1217,10 +1259,25 @@ static int do_output(int argc, char *argv[],
                 int adl_idx = -1;
                 VkPhysicalDeviceProperties2 amd_props2 = {0};
                 VkPhysicalDevicePCIBusInfoPropertiesEXT amd_pci = {0};
+                VkPhysicalDeviceIDProperties amd_id = {0};
                 amd_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
                 amd_props2.pNext = &amd_pci;
                 amd_pci.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
+                amd_pci.pNext = &amd_id;
+                amd_id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
                 vkGetPhysicalDeviceProperties2(phys_devices[i], &amd_props2);
+
+                uint32_t amd_luid_low = 0, amd_luid_high = 0;
+                if (amd_id.deviceLUIDValid) {
+                    amd_luid_low  = ((uint32_t)amd_id.deviceLUID[0])       |
+                                    ((uint32_t)amd_id.deviceLUID[1] << 8)  |
+                                    ((uint32_t)amd_id.deviceLUID[2] << 16) |
+                                    ((uint32_t)amd_id.deviceLUID[3] << 24);
+                    amd_luid_high = ((uint32_t)amd_id.deviceLUID[4])       |
+                                    ((uint32_t)amd_id.deviceLUID[5] << 8)  |
+                                    ((uint32_t)amd_id.deviceLUID[6] << 16) |
+                                    ((uint32_t)amd_id.deviceLUID[7] << 24);
+                }
 
                 printf("\n  --- AMD Dynamic Info (ADL) ---\n");
                 /* Prefer PCI topology so two identical AMD GPUs don't
@@ -1241,6 +1298,8 @@ static int do_output(int argc, char *argv[],
 
                     if (adl_get_fan_speed(adl_idx, &rpm, &pct) == 0)
                         printf("  Fan Speed       : %d%% (%d RPM)\n", pct, rpm);
+                    else if (adl_get_pmlog_fan(adl_idx, &rpm, &pct) == 0)
+                        printf("  Fan Speed       : %d%% (%d RPM)\n", pct, rpm);
                     else
                         printf("  Fan Speed       : N/A\n");
 
@@ -1248,26 +1307,64 @@ static int do_output(int argc, char *argv[],
                         printf("  GPU Utilization : %d%%\n", act);
                         printf("  Engine Clock    : %d MHz\n", eng / 100);
                         printf("  Memory Clock    : %d MHz\n", mem_clk / 100);
-                        printf("  Perf Level      : P%d\n", lvl);
+                        if (lvl >= 0)
+                            printf("  Perf Level      : P%d\n", lvl);
+                        else
+                            printf("  Perf Level      : N/A\n");
                     } else {
                         printf("  GPU Utilization : N/A\n");
                         printf("  Engine Clock    : N/A\n");
                         printf("  Memory Clock    : N/A\n");
                         printf("  Perf Level      : N/A\n");
+                        if (amd_id.deviceLUIDValid) {
+                            int u;
+                            if (winmem_get_utilization(amd_luid_low, amd_luid_high, &u) == 0)
+                                printf("  GPU Utilization : %d%% (PDH)\n", u);
+                        }
+                    }
+
+                    /* PMLog power -- works on iGPUs/APUs */
+                    {
+                        int pwr;
+                        if (adl_get_pmlog_power(adl_idx, &pwr) == 0 && pwr > 0)
+                            printf("  GPU Power       : %.1f W\n", pwr / 1000.0);
+                        else
+                            printf("  GPU Power       : N/A\n");
                     }
 
                     {
                         uint64_t vram_used, vram_total;
+                        int mem_ok = 0;
                         if (adl_get_memory(adl_idx, &vram_used, &vram_total) == 0) {
                             if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
                                 uint64_t vt = dedicated_vram + shared_ram;
                                 if (vt > vram_total)
                                     vram_total = vt;
+                                if (amd_id.deviceLUIDValid) {
+                                    uint64_t ded = 0, sha = 0, tot = 0;
+                                    if (winmem_get_memory(amd_luid_low, amd_luid_high,
+                                                          &ded, &sha, &tot) == 0) {
+                                        vram_used  = sha + ded;
+                                        vram_total = tot;
+                                    }
+                                }
                             }
+                            mem_ok = 1;
+                        } else if (amd_id.deviceLUIDValid &&
+                                   props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                            uint64_t ded = 0, sha = 0, tot = 0;
+                            if (winmem_get_memory(amd_luid_low, amd_luid_high,
+                                                  &ded, &sha, &tot) == 0) {
+                                vram_used  = sha + ded;
+                                vram_total = tot;
+                                mem_ok = 1;
+                            }
+                        }
+                        if (mem_ok)
                             printf("  Memory Usage    : %llu / %llu MB\n",
                                    (unsigned long long)(vram_used / (1024ULL * 1024ULL)),
                                    (unsigned long long)(vram_total / (1024ULL * 1024ULL)));
-                        } else
+                        else
                             printf("  Memory Usage    : N/A\n");
                     }
                 } else {
@@ -1805,6 +1902,7 @@ int main(int argc, char *argv[])
 #ifdef _WIN32
         adl_init();
         intel_init();
+        winmem_init();
 #endif
 #ifdef __linux__
         sysfs_init();
@@ -1938,6 +2036,7 @@ int main(int argc, char *argv[])
     free(phys_devices);
     nvml_shutdown();
 #ifdef _WIN32
+    winmem_shutdown();
     adl_shutdown();
     intel_shutdown();
 #endif

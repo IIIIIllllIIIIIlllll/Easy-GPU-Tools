@@ -93,6 +93,46 @@ typedef struct {
 } ADLMemoryInfo2;
 
 /* ------------------------------------------------------------------
+ *  PMLog structures (from ADL SDK adl_structures.h / adl_defines.h)
+ *
+ *  ADL2_New_QueryPMLogData_Get returns ADLPMLogDataOutput -- a snapshot
+ *  of all sensor values, indexed directly by ADL_PMLOG_SENSORS enum.
+ *  This is the modern AMD telemetry path that works on iGPUs/APUs
+ *  where the legacy OverdriveN/Overdrive5 APIs return nothing.
+ * ------------------------------------------------------------------ */
+
+#define ADL_PMLOG_MAX_SENSORS 256
+
+/* ADL_PMLOG_SENSORS enum values (subset we use) */
+#define ADL_PMLOG_CLK_GFXCLK            1   /* MHz       */
+#define ADL_PMLOG_CLK_MEMCLK            2   /* MHz       */
+#define ADL_PMLOG_CLK_SOCCLK            3   /* MHz       */
+#define ADL_PMLOG_CLK_VCNCLK            7   /* MHz       */
+#define ADL_PMLOG_FAN_RPM              14   /* RPM       */
+#define ADL_PMLOG_FAN_PERCENTAGE        15   /* percent   */
+#define ADL_PMLOG_INFO_ACTIVITY_GFX    19   /* percent   */
+#define ADL_PMLOG_INFO_ACTIVITY_MEM    20   /* percent   */
+#define ADL_PMLOG_ASIC_POWER           23   /* Watts     */
+#define ADL_PMLOG_TEMPERATURE_GFX      28   /* Celsius   */
+#define ADL_PMLOG_TEMPERATURE_SOC      29   /* Celsius   */
+#define ADL_PMLOG_GFX_POWER            30   /* Watts     */
+#define ADL_PMLOG_TEMPERATURE_CPU      32   /* Celsius   */
+#define ADL_PMLOG_CPU_POWER            33   /* Watts     */
+#define ADL_PMLOG_CLK_CPUCLK           34   /* MHz       */
+#define ADL_PMLOG_SSPAIRED_ASICPOWER   46   /* Watts (APU) */
+#define ADL_PMLOG_BOARD_POWER          73   /* Watts     */
+
+typedef struct {
+    int supported;
+    int value;
+} ADLSingleSensorData;
+
+typedef struct {
+    int size;
+    ADLSingleSensorData sensors[ADL_PMLOG_MAX_SENSORS];
+} ADLPMLogDataOutput;                          /* 4 + 256*8 = 2052 bytes */
+
+/* ------------------------------------------------------------------
  *  Function pointer typedefs (__stdcall matches the DLL exports)
  * ------------------------------------------------------------------ */
 
@@ -126,6 +166,9 @@ typedef int (__stdcall *PFN_VRAM_USAGE2)          (ADL_CONTEXT_HANDLE, int, int*
 typedef int (__stdcall *PFN_DEDICATED_VRAM_USAGE2)(ADL_CONTEXT_HANDLE, int, int*);
 typedef int (__stdcall *PFN_SHARED_VRAM_USAGE2)   (ADL_CONTEXT_HANDLE, int, int*);
 
+/* PMLog snapshot -- ADL2_New_QueryPMLogData_Get */
+typedef int (__stdcall *PFN_PMLOG_QUERY)(ADL_CONTEXT_HANDLE, int, ADLPMLogDataOutput*);
+
 /* ------------------------------------------------------------------
  *  Static state
  * ------------------------------------------------------------------ */
@@ -157,6 +200,8 @@ static PFN_MEMORY_INFO2 pfn_MemoryInfo2 = NULL;
 static PFN_VRAM_USAGE2           pfn_VramUsage2           = NULL;
 static PFN_DEDICATED_VRAM_USAGE2 pfn_DedicatedVramUsage2  = NULL;
 static PFN_SHARED_VRAM_USAGE2    pfn_SharedVramUsage2     = NULL;
+
+static PFN_PMLOG_QUERY  pfn_PMLogQuery = NULL;
 
 static int              g_num_adapters  = 0;
 static ADLAdapterInfo  *g_adapters      = NULL;
@@ -234,6 +279,9 @@ int adl_init(void)
     GET(pfn_VramUsage2,           "ADL2_Adapter_VRAMUsage_Get");
     GET(pfn_DedicatedVramUsage2,  "ADL2_Adapter_DedicatedVRAMUsage_Get");
     GET(pfn_SharedVramUsage2,     "ADL2_Adapter_SharedVRAMUsage_Get");
+
+    /* PMLog snapshot -- the modern telemetry path for iGPUs/APUs */
+    GET(pfn_PMLogQuery, "ADL2_New_QueryPMLogData_Get");
 
     /* create ADL2 context first (needed by modern functions) */
     if (pfn_Create2) {
@@ -367,11 +415,93 @@ int adl_find_by_pci_topology(uint32_t domain, uint32_t bus,
 }
 
 /* ------------------------------------------------------------------
+ *  PMLog snapshot  --  ADL2_New_QueryPMLogData_Get
+ *
+ *  Returns 0 and fills *out on success, -1 on failure.
+ *  The caller owns the output; pass a stack/heap ADLPMLogDataOutput.
+ *  This is the path that actually works on AMD iGPUs/APUs.
+ * ------------------------------------------------------------------ */
+
+int adl_get_pmlog(int adapter_index, void *out)
+{
+    ADLPMLogDataOutput *pm = (ADLPMLogDataOutput*)out;
+    if (g_init_ok <= 0 || !g_adl2_ctx || !pfn_PMLogQuery)
+        return -1;
+    memset(pm, 0, sizeof(*pm));
+    pm->size = (int)sizeof(*pm);
+    if (pfn_PMLogQuery(g_adl2_ctx, adapter_index, pm) != ADL_OK)
+        return -1;
+    return 0;
+}
+
+/* adl_get_pmlog_power -- best available power reading in milliwatts.
+ * PMLog power sensors return integer Watts; convert to mW (*1000). */
+int adl_get_pmlog_power(int adapter_index, int *power_milliwatts)
+{
+    ADLPMLogDataOutput pm;
+    if (adl_get_pmlog(adapter_index, &pm) != 0)
+        return -1;
+    /* prefer ASIC_POWER (whole-package), then GFX_POWER, then APU_POWER */
+    if (pm.sensors[ADL_PMLOG_ASIC_POWER].supported) {
+        *power_milliwatts = pm.sensors[ADL_PMLOG_ASIC_POWER].value * 1000;
+        return 0;
+    }
+    if (pm.sensors[ADL_PMLOG_GFX_POWER].supported) {
+        *power_milliwatts = pm.sensors[ADL_PMLOG_GFX_POWER].value * 1000;
+        return 0;
+    }
+    if (pm.sensors[ADL_PMLOG_SSPAIRED_ASICPOWER].supported) {
+        *power_milliwatts = pm.sensors[ADL_PMLOG_SSPAIRED_ASICPOWER].value * 1000;
+        return 0;
+    }
+    return -1;
+}
+
+/* adl_get_pmlog_fan -- fan RPM and percent from PMLog.
+ * iGPUs/APUs typically have no fan sensor (returns -1). */
+int adl_get_pmlog_fan(int adapter_index, int *rpm, int *percent)
+{
+    ADLPMLogDataOutput pm;
+    int got = 0;
+    if (adl_get_pmlog(adapter_index, &pm) != 0)
+        return -1;
+    *rpm = 0; *percent = 0;
+    if (pm.sensors[ADL_PMLOG_FAN_RPM].supported) {
+        *rpm = pm.sensors[ADL_PMLOG_FAN_RPM].value;
+        got = 1;
+    }
+    if (pm.sensors[ADL_PMLOG_FAN_PERCENTAGE].supported) {
+        *percent = pm.sensors[ADL_PMLOG_FAN_PERCENTAGE].value;
+        got = 1;
+    }
+    return got ? 0 : -1;
+}
+
+/* ------------------------------------------------------------------
  *  Query helpers  --  try OverdriveN first, fall back to Overdrive5/6
  * ------------------------------------------------------------------ */
 
 int adl_get_temperature(int idx, int *milli_c)
 {
+    /* try PMLog first -- the path that works on iGPUs/APUs.
+     * PMLog returns integer Celsius; convert to millidegrees. */
+    if (g_adl2_ctx && pfn_PMLogQuery) {
+        ADLPMLogDataOutput pm;
+        if (adl_get_pmlog(idx, &pm) == 0) {
+            /* prefer TEMPERATURE_GFX (sensor 28), fall back to SOC (29) */
+            if (pm.sensors[ADL_PMLOG_TEMPERATURE_GFX].supported &&
+                pm.sensors[ADL_PMLOG_TEMPERATURE_GFX].value > 0) {
+                *milli_c = pm.sensors[ADL_PMLOG_TEMPERATURE_GFX].value * 1000;
+                return 0;
+            }
+            if (pm.sensors[ADL_PMLOG_TEMPERATURE_SOC].supported &&
+                pm.sensors[ADL_PMLOG_TEMPERATURE_SOC].value > 0) {
+                *milli_c = pm.sensors[ADL_PMLOG_TEMPERATURE_SOC].value * 1000;
+                return 0;
+            }
+        }
+    }
+
     /* try OverdriveN (ADL2) -- returned value is millidegrees C */
     if (g_adl2_ctx && pfn_ODN_Temp2) {
         int t = 0;
@@ -424,6 +554,31 @@ int adl_get_activity(int idx,
                       int *activity_pct,
                       int *perf_level)
 {
+    /* try PMLog first -- the path that works on iGPUs/APUs.
+     * PMLog returns GFXCLK/MEMCLK in MHz; convert to 10 kHz (*100).
+     * activity is already 0-100 percent. perf_level is not in PMLog,
+     * so we leave it as -1 (caller treats sentinel). */
+    if (g_adl2_ctx && pfn_PMLogQuery) {
+        ADLPMLogDataOutput pm;
+        if (adl_get_pmlog(idx, &pm) == 0) {
+            int got = 0;
+            if (pm.sensors[ADL_PMLOG_INFO_ACTIVITY_GFX].supported) {
+                *activity_pct = pm.sensors[ADL_PMLOG_INFO_ACTIVITY_GFX].value;
+                got = 1;
+            } else *activity_pct = 0;
+            if (pm.sensors[ADL_PMLOG_CLK_GFXCLK].supported) {
+                *eng_clock_10khz = pm.sensors[ADL_PMLOG_CLK_GFXCLK].value * 100;
+                got = 1;
+            } else *eng_clock_10khz = 0;
+            if (pm.sensors[ADL_PMLOG_CLK_MEMCLK].supported) {
+                *mem_clock_10khz = pm.sensors[ADL_PMLOG_CLK_MEMCLK].value * 100;
+                got = 1;
+            } else *mem_clock_10khz = 0;
+            *perf_level = -1;
+            if (got) return 0;
+        }
+    }
+
     /* try OverdriveN (ADL2) */
     if (g_adl2_ctx && pfn_ODN_Perf2) {
         ADLODNPerfStatus p; memset(&p, 0, sizeof(p));

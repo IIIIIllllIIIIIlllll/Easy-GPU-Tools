@@ -38,6 +38,7 @@ add_executable(gpu-info
     src/backend_sysfs.c
     src/backend_nvml.c
     src/backend_sysinfo.c
+    src/backend_winmem.c
 )
 
 # Vulkan loaded dynamically via backend_vulkan.c -- no import library needed
@@ -55,6 +56,11 @@ endif()
 
 if(UNIX)
     target_link_libraries(gpu-info PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
+if(WIN32)
+    # backend_winmem.c uses PDH (pdh.lib)
+    target_link_libraries(gpu-info PRIVATE pdh)
 endif()
 
 
