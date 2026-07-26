@@ -32,8 +32,10 @@ int winmem_get_memory(uint32_t luid_low, uint32_t luid_high,
                       uint64_t *total_committed);
 
 /* Get GPU utilization percentage via PDH "GPU Engine" counters.
- * Aggregates utilization across engine types (3D, compute, copy,
- * video) for the given LUID, taking the max across engines.
+ * Covers all engine types (3D, compute, copy, video, ...) for the given
+ * LUID: utilization is summed per physical engine across the processes
+ * sharing it, and the busiest engine's value is returned (matching Task
+ * Manager's overall "GPU" view).
  * Returns 0 and sets *util_pct (0-100) on success, -1 on failure. */
 int winmem_get_utilization(uint32_t luid_low, uint32_t luid_high,
                            int *util_pct);

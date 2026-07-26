@@ -31,7 +31,11 @@
 typedef void *ADL_CONTEXT_HANDLE;
 typedef void* (__stdcall *ADL_MALLOC_CB)(int);
 
-/* AdapterInfo -- layout from AMD ADL SDK (fields after name are ignored) */
+/* AdapterInfo -- exact layout from AMD ADL SDK adl_structures.h
+ * (Windows variant, ADL_MAX_PATH = 256, total 1572 bytes).  Do NOT
+ * shrink this to an opaque padding blob: ADL_Adapter_AdapterInfo_Get
+ * writes the full array at this stride, so a wrong size misaligns
+ * every adapter after the first. */
 typedef struct {
     int  iSize;                   /*   0 */
     int  iAdapterIndex;           /*   4 */
@@ -41,8 +45,17 @@ typedef struct {
     int  iFunctionNumber;         /* 272 */
     int  iVendorID;               /* 276 */
     char strAdapterName[256];     /* 280 */
-    char _pad[1488];              /* fields after name vary by driver */
-} ADLAdapterInfo;
+    char strDisplayName[256];     /* 536 */
+    int  iPresent;                /* 792 */
+    int  iExist;                  /* 796 */
+    char strDriverPath[256];      /* 800 */
+    char strDriverPathExt[256];   /* 1056 */
+    char strPNPString[256];       /* 1312 */
+    int  iOSDisplayIndex;         /* 1568 */
+} ADLAdapterInfo;                 /* total: 1572 bytes */
+
+typedef char adl_adapter_info_size_check[
+    (sizeof(ADLAdapterInfo) == 1572) ? 1 : -1];
 
 /* Overdrive5 (legacy) */
 typedef struct { int iSize; int iTemperature; } ADLOD5Temp;
@@ -242,7 +255,7 @@ int adl_init(void)
 {
     int i, r;
 
-    if (g_init_ok)  return 0;
+    if (g_init_ok > 0)  return 0;
     if (g_init_ok < 0) return -1;
 
     g_hDll = LoadLibraryA("atiadlxx.dll");
@@ -376,12 +389,23 @@ int adl_find_by_pci(uint32_t vendor_id, uint32_t device_id, int *adl_index)
 {
     int i;
     if (g_init_ok <= 0 || !g_adapters) return -1;
-    (void)device_id;
     for (i = 0; i < g_num_adapters; i++) {
-        if ((uint32_t)g_adapters[i].iVendorID == vendor_id) {
-            *adl_index = i;
-            return 0;
+        if ((uint32_t)g_adapters[i].iVendorID != vendor_id)
+            continue;
+        /* AdapterInfo has no device-ID field, but the UDID embeds it
+         * (e.g. "PCI_VEN_1002&DEV_15BF...").  Compare it when parseable
+         * so an iGPU and a dGPU from the same vendor aren't confused. */
+        {
+            const char *dev = strstr(g_adapters[i].strUDID, "DEV_");
+            if (dev) {
+                unsigned parsed = 0;
+                if (sscanf(dev + 4, "%4x", &parsed) == 1 &&
+                    parsed != device_id)
+                    continue;
+            }
         }
+        *adl_index = i;
+        return 0;
     }
     return -1;
 }
@@ -548,6 +572,11 @@ int adl_get_fan_speed(int idx, int *rpm, int *percent)
     return -1;
 }
 
+/* adl_get_activity -- returns a bitmask of ADL_ACT_VALID_* describing
+ * which output fields were actually filled, or -1 on total failure.
+ * PMLog reports per-sensor "supported" flags; a missing sensor must NOT
+ * be reported as 0 -- the caller uses the mask to decide which fields
+ * to trust and whether to fall back to another data source. */
 int adl_get_activity(int idx,
                       int *eng_clock_10khz,
                       int *mem_clock_10khz,
@@ -556,30 +585,29 @@ int adl_get_activity(int idx,
 {
     /* try PMLog first -- the path that works on iGPUs/APUs.
      * PMLog returns GFXCLK/MEMCLK in MHz; convert to 10 kHz (*100).
-     * activity is already 0-100 percent. perf_level is not in PMLog,
-     * so we leave it as -1 (caller treats sentinel). */
+     * activity is already 0-100 percent.  perf_level is not in PMLog,
+     * so its bit is never set on this path. */
     if (g_adl2_ctx && pfn_PMLogQuery) {
         ADLPMLogDataOutput pm;
         if (adl_get_pmlog(idx, &pm) == 0) {
-            int got = 0;
+            int mask = 0;
             if (pm.sensors[ADL_PMLOG_INFO_ACTIVITY_GFX].supported) {
                 *activity_pct = pm.sensors[ADL_PMLOG_INFO_ACTIVITY_GFX].value;
-                got = 1;
-            } else *activity_pct = 0;
+                mask |= ADL_ACT_VALID_ACTIVITY;
+            }
             if (pm.sensors[ADL_PMLOG_CLK_GFXCLK].supported) {
                 *eng_clock_10khz = pm.sensors[ADL_PMLOG_CLK_GFXCLK].value * 100;
-                got = 1;
-            } else *eng_clock_10khz = 0;
+                mask |= ADL_ACT_VALID_ENG_CLOCK;
+            }
             if (pm.sensors[ADL_PMLOG_CLK_MEMCLK].supported) {
                 *mem_clock_10khz = pm.sensors[ADL_PMLOG_CLK_MEMCLK].value * 100;
-                got = 1;
-            } else *mem_clock_10khz = 0;
-            *perf_level = -1;
-            if (got) return 0;
+                mask |= ADL_ACT_VALID_MEM_CLOCK;
+            }
+            if (mask) return mask;
         }
     }
 
-    /* try OverdriveN (ADL2) */
+    /* try OverdriveN (ADL2) -- all four fields valid on success */
     if (g_adl2_ctx && pfn_ODN_Perf2) {
         ADLODNPerfStatus p; memset(&p, 0, sizeof(p));
         if (pfn_ODN_Perf2(g_adl2_ctx, idx, &p) == ADL_OK) {
@@ -587,7 +615,7 @@ int adl_get_activity(int idx,
             *mem_clock_10khz = p.iMemoryClock;
             *activity_pct    = p.iGPUActivityPercent;
             *perf_level      = p.iCurrentCorePerformanceLevel;
-            return 0;
+            return ADL_ACT_VALID_ALL;
         }
     }
 
@@ -599,41 +627,41 @@ int adl_get_activity(int idx,
             *mem_clock_10khz = a.iMemoryClock;
             *activity_pct    = a.iActivityPercent;
             *perf_level      = a.iCurrentPerformanceLevel;
-            return 0;
+            return ADL_ACT_VALID_ALL;
         }
     }
 
     return -1;
 }
 
+/* adl_get_memory -- returns a bitmask of ADL_MEM_VALID_* describing
+ * which output fields were actually filled, or -1 on total failure.
+ * An output is only written when its bit is set, so the caller never
+ * mistakes "unknown" for 0 bytes. */
 int adl_get_memory(int idx, uint64_t *used_bytes, uint64_t *total_bytes)
 {
-    int ok_total = 0;
-    int ok_used  = 0;
-
-    *used_bytes  = 0;
-    *total_bytes = 0;
+    int mask = 0;
 
     /* total VRAM from ADL_Adapter_MemoryInfo_Get */
     if (pfn_MemoryInfo) {
         ADLMemoryInfo mi; memset(&mi, 0, sizeof(mi));
         if (pfn_MemoryInfo(idx, &mi) == ADL_OK && mi.iMemorySize > 0) {
             *total_bytes = (uint64_t)mi.iMemorySize;
-            ok_total = 1;
+            mask |= ADL_MEM_VALID_TOTAL;
         }
     }
 
     /* fallback total for APUs / newer drivers */
-    if (!ok_total && pfn_MemoryInfo2) {
+    if (!(mask & ADL_MEM_VALID_TOTAL) && pfn_MemoryInfo2) {
         ADLMemoryInfo2 mi2; memset(&mi2, 0, sizeof(mi2));
         if (pfn_MemoryInfo2(idx, &mi2) == ADL_OK && mi2.iMemorySize > 0) {
             *total_bytes = (uint64_t)mi2.iMemorySize;
-            ok_total = 1;
+            mask |= ADL_MEM_VALID_TOTAL;
         }
     }
 
     if (!g_adl2_ctx)
-        return ok_total ? 0 : -1;
+        return mask ? mask : -1;
 
     /* ADL2 usage -- functions return megabytes.
      * Prefer dedicated + shared; fall back to the aggregate value. */
@@ -651,18 +679,16 @@ int adl_get_memory(int idx, uint64_t *used_bytes, uint64_t *total_bytes)
             if (r1 == ADL_OK) sum += ded_mb;
             if (r2 == ADL_OK) sum += shared_mb;
             *used_bytes = (uint64_t)sum * 1024ULL * 1024ULL;
-            ok_used = 1;
+            mask |= ADL_MEM_VALID_USED;
         } else if (pfn_VramUsage2 &&
                    (r3 = pfn_VramUsage2(g_adl2_ctx, idx, &total_mb)) == ADL_OK &&
                    total_mb >= 0) {
             *used_bytes = (uint64_t)total_mb * 1024ULL * 1024ULL;
-            ok_used = 1;
+            mask |= ADL_MEM_VALID_USED;
         }
     }
 
-    if (ok_total || ok_used)
-        return 0;
-    return -1;
+    return mask ? mask : -1;
 }
 
 #endif /* _WIN32 */

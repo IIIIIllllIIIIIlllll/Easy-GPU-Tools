@@ -31,6 +31,17 @@ int adl_find_by_pci_topology(uint32_t domain, uint32_t bus,
                              uint32_t device, uint32_t function,
                              int *adl_index);
 
+/* Validity bits returned by adl_get_activity(). */
+#define ADL_ACT_VALID_ENG_CLOCK  0x01
+#define ADL_ACT_VALID_MEM_CLOCK  0x02
+#define ADL_ACT_VALID_ACTIVITY   0x04
+#define ADL_ACT_VALID_PERF_LEVEL 0x08
+#define ADL_ACT_VALID_ALL        0x0F
+
+/* Validity bits returned by adl_get_memory(). */
+#define ADL_MEM_VALID_USED       0x01
+#define ADL_MEM_VALID_TOTAL      0x02
+
 /* ADL2_OverdriveN_Temperature_Get / ADL_Overdrive5_Temperature_Get.
  * Returns temperature in millidegrees Celsius. 0 on success, -1 on failure. */
 int adl_get_temperature(int adapter_index, int *temp_milli_c);
@@ -39,20 +50,24 @@ int adl_get_temperature(int adapter_index, int *temp_milli_c);
  * Returns fan RPM and percentage. 0 on success, -1 on failure. */
 int adl_get_fan_speed(int adapter_index, int *rpm, int *percent);
 
-/* ADL2_OverdriveN_PerformanceStatus_Get / ADL_Overdrive5_CurrentActivity_Get.
+/* ADL2_OverdriveN_PerformanceStatus_Get / ADL_Overdrive5_CurrentActivity_Get
+ * / PMLog sensors.
  * engine_clock:    in 10 kHz (divide by 100 -> MHz)
  * memory_clock:    in 10 kHz (divide by 100 -> MHz)
  * activity_percent: GPU utilization (0-100)
  * perf_level:       current performance level / P-State (0=low, higher=perf)
- * Returns 0 on success, -1 on failure. */
+ * Returns a bitmask of ADL_ACT_VALID_* telling which outputs were
+ * actually written (a missing sensor is never reported as 0), or -1
+ * when no field could be obtained at all. */
 int adl_get_activity(int adapter_index,
                      int *engine_clock_10khz,
                      int *memory_clock_10khz,
                      int *activity_percent,
                      int *perf_level);
 
-/* ADL2_Adapter_MemoryInfo_Get + ADL2_Adapter_VRAMUsage_Get.
- * Returns used and total VRAM in bytes. 0 on success, -1 on failure. */
+/* ADL_Adapter_MemoryInfo_Get + ADL2_Adapter_VRAMUsage_Get.
+ * Returns a bitmask of ADL_MEM_VALID_* telling which outputs were
+ * actually written (values in bytes), or -1 on total failure. */
 int adl_get_memory(int adapter_index, uint64_t *used_bytes,
                    uint64_t *total_bytes);
 

@@ -295,12 +295,21 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
             }
 
             int eng, mem_clk, act, lvl;
-            if (adl_get_activity(adl_idx, &eng, &mem_clk, &act, &lvl) == 0) {
-                info->utilization_gpu_pct = act;
-                info->core_clock_mhz      = eng / 100;
-                info->mem_clock_mhz       = mem_clk / 100;
-                info->perf_state          = lvl;
-            } else if (id_props.deviceLUIDValid) {
+            int act_mask = adl_get_activity(adl_idx, &eng, &mem_clk, &act, &lvl);
+            if (act_mask > 0) {
+                /* trust only the fields the backend actually filled;
+                 * a missing PMLog sensor is never reported as 0 */
+                if (act_mask & ADL_ACT_VALID_ACTIVITY)
+                    info->utilization_gpu_pct = act;
+                if (act_mask & ADL_ACT_VALID_ENG_CLOCK)
+                    info->core_clock_mhz = eng / 100;
+                if (act_mask & ADL_ACT_VALID_MEM_CLOCK)
+                    info->mem_clock_mhz = mem_clk / 100;
+                if (act_mask & ADL_ACT_VALID_PERF_LEVEL)
+                    info->perf_state = lvl;
+            }
+            if ((act_mask <= 0 || (act_mask & ADL_ACT_VALID_ACTIVITY) == 0) &&
+                id_props.deviceLUIDValid) {
                 /* AMD iGPU/APU fallback: Windows PDH GPU Engine counters */
                 int util;
                 if (winmem_get_utilization(luid_low, luid_high, &util) == 0) {
@@ -315,27 +324,30 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
                     info->power_milliwatts = pwr;
             }
 
-            uint64_t vram_used, vram_total;
-            if (adl_get_memory(adl_idx, &vram_used, &vram_total) == 0) {
-                info->mem_used_bytes  = vram_used;
-                info->mem_total_bytes = vram_total;
+            uint64_t vram_used = 0, vram_total = 0;
+            int mem_mask = adl_get_memory(adl_idx, &vram_used, &vram_total);
+            if (mem_mask > 0) {
+                if (mem_mask & ADL_MEM_VALID_USED)
+                    info->mem_used_bytes  = vram_used;
+                if (mem_mask & ADL_MEM_VALID_TOTAL)
+                    info->mem_total_bytes = vram_total;
             }
 
             /* memory: for AMD iGPUs ADL only reports the small
              * hardware-reserved segment; use the Vulkan-visible total.
-             * Additionally, supplement with PDH Windows counters which
-             * provide the true shared usage + total committed budget. */
+             * PDH counters then refine the *current usage* figure.
+             * Note: PDH "Total Committed" is a dynamic committed amount,
+             * not a capacity -- it must never become mem_total_bytes. */
             if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
                 uint64_t vt = info->dedicated_vram_bytes + info->shared_ram_bytes;
                 if (vt > info->mem_total_bytes)
                     info->mem_total_bytes = vt;
 
                 if (id_props.deviceLUIDValid) {
-                    uint64_t ded = 0, sha = 0, tot = 0;
+                    uint64_t ded = 0, sha = 0;
                     if (winmem_get_memory(luid_low, luid_high,
-                                          &ded, &sha, &tot) == 0) {
-                        info->mem_used_bytes  = sha + ded;
-                        info->mem_total_bytes = tot;
+                                          &ded, &sha, NULL) == 0) {
+                        info->mem_used_bytes = sha + ded;
                     }
                 }
             }
@@ -1303,24 +1315,38 @@ static int do_output(int argc, char *argv[],
                     else
                         printf("  Fan Speed       : N/A\n");
 
-                    if (adl_get_activity(adl_idx, &eng, &mem_clk, &act, &lvl) == 0) {
-                        printf("  GPU Utilization : %d%%\n", act);
-                        printf("  Engine Clock    : %d MHz\n", eng / 100);
-                        printf("  Memory Clock    : %d MHz\n", mem_clk / 100);
-                        if (lvl >= 0)
+                    {
+                        int act_mask = adl_get_activity(adl_idx, &eng,
+                                                        &mem_clk, &act, &lvl);
+                        int printed_util = 0;
+                        if (act_mask > 0 && (act_mask & ADL_ACT_VALID_ACTIVITY)) {
+                            printf("  GPU Utilization : %d%%\n", act);
+                            printed_util = 1;
+                        } else if (amd_id.deviceLUIDValid) {
+                            int u;
+                            if (winmem_get_utilization(amd_luid_low,
+                                                       amd_luid_high, &u) == 0) {
+                                printf("  GPU Utilization : %d%% (PDH)\n", u);
+                                printed_util = 1;
+                            }
+                        }
+                        if (!printed_util)
+                            printf("  GPU Utilization : N/A\n");
+
+                        if (act_mask > 0 && (act_mask & ADL_ACT_VALID_ENG_CLOCK))
+                            printf("  Engine Clock    : %d MHz\n", eng / 100);
+                        else
+                            printf("  Engine Clock    : N/A\n");
+
+                        if (act_mask > 0 && (act_mask & ADL_ACT_VALID_MEM_CLOCK))
+                            printf("  Memory Clock    : %d MHz\n", mem_clk / 100);
+                        else
+                            printf("  Memory Clock    : N/A\n");
+
+                        if (act_mask > 0 && (act_mask & ADL_ACT_VALID_PERF_LEVEL))
                             printf("  Perf Level      : P%d\n", lvl);
                         else
                             printf("  Perf Level      : N/A\n");
-                    } else {
-                        printf("  GPU Utilization : N/A\n");
-                        printf("  Engine Clock    : N/A\n");
-                        printf("  Memory Clock    : N/A\n");
-                        printf("  Perf Level      : N/A\n");
-                        if (amd_id.deviceLUIDValid) {
-                            int u;
-                            if (winmem_get_utilization(amd_luid_low, amd_luid_high, &u) == 0)
-                                printf("  GPU Utilization : %d%% (PDH)\n", u);
-                        }
                     }
 
                     /* PMLog power -- works on iGPUs/APUs */
@@ -1333,36 +1359,41 @@ static int do_output(int argc, char *argv[],
                     }
 
                     {
-                        uint64_t vram_used, vram_total;
-                        int mem_ok = 0;
-                        if (adl_get_memory(adl_idx, &vram_used, &vram_total) == 0) {
-                            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
-                                uint64_t vt = dedicated_vram + shared_ram;
-                                if (vt > vram_total)
-                                    vram_total = vt;
-                                if (amd_id.deviceLUIDValid) {
-                                    uint64_t ded = 0, sha = 0, tot = 0;
-                                    if (winmem_get_memory(amd_luid_low, amd_luid_high,
-                                                          &ded, &sha, &tot) == 0) {
-                                        vram_used  = sha + ded;
-                                        vram_total = tot;
-                                    }
+                        uint64_t vram_used = 0, vram_total = 0;
+                        int mem_mask = adl_get_memory(adl_idx, &vram_used,
+                                                      &vram_total);
+                        if (mem_mask < 0)
+                            mem_mask = 0;
+                        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                            /* iGPU: ADL only reports the small reserved
+                             * segment; the Vulkan-visible total is the
+                             * better capacity figure. */
+                            uint64_t vt = dedicated_vram + shared_ram;
+                            if (!(mem_mask & ADL_MEM_VALID_TOTAL) ||
+                                vt > vram_total) {
+                                vram_total = vt;
+                                mem_mask |= ADL_MEM_VALID_TOTAL;
+                            }
+                            /* PDH refines current usage.  Never use its
+                             * "Total Committed" as capacity -- it is a
+                             * dynamic committed amount, not a total. */
+                            if (amd_id.deviceLUIDValid) {
+                                uint64_t ded = 0, sha = 0;
+                                if (winmem_get_memory(amd_luid_low,
+                                                      amd_luid_high,
+                                                      &ded, &sha, NULL) == 0) {
+                                    vram_used = sha + ded;
+                                    mem_mask |= ADL_MEM_VALID_USED;
                                 }
                             }
-                            mem_ok = 1;
-                        } else if (amd_id.deviceLUIDValid &&
-                                   props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
-                            uint64_t ded = 0, sha = 0, tot = 0;
-                            if (winmem_get_memory(amd_luid_low, amd_luid_high,
-                                                  &ded, &sha, &tot) == 0) {
-                                vram_used  = sha + ded;
-                                vram_total = tot;
-                                mem_ok = 1;
-                            }
                         }
-                        if (mem_ok)
+                        if ((mem_mask & ADL_MEM_VALID_USED) &&
+                            (mem_mask & ADL_MEM_VALID_TOTAL))
                             printf("  Memory Usage    : %llu / %llu MB\n",
                                    (unsigned long long)(vram_used / (1024ULL * 1024ULL)),
+                                   (unsigned long long)(vram_total / (1024ULL * 1024ULL)));
+                        else if (mem_mask & ADL_MEM_VALID_TOTAL)
+                            printf("  Memory Total    : %llu MB\n",
                                    (unsigned long long)(vram_total / (1024ULL * 1024ULL)));
                         else
                             printf("  Memory Usage    : N/A\n");
