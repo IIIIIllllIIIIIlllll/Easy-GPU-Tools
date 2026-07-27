@@ -19,6 +19,11 @@ extern "C" {
  * Returns 0 on success, -1 if library not found or init fails. */
 int nvml_init(void);
 
+/* Enable stderr diagnostics for NVML init failures (off by default so
+ * non-NVIDIA machines stay quiet).  A retry is performed on the next
+ * nvml_init() call if a previous silent probe had already failed. */
+void nvml_set_diag(int on);
+
 /* Shutdown NVML and unload library. Safe to call anytime. */
 void nvml_shutdown(void);
 
@@ -58,6 +63,15 @@ int nvml_get_ecc(int idx, int *enabled);
 
 /* Driver version string (e.g. "580.159.03"). 0 = success. */
 int nvml_get_driver_version(char *buf, size_t buf_size);
+
+/* Number of NVML devices (0 when NVML is unavailable). */
+unsigned int nvml_get_device_count(void);
+
+/* GPU marketing name (e.g. "P104-100"). 0 = success. */
+int nvml_get_name(int idx, char *buf, size_t buf_size);
+
+/* PCI device ID (e.g. 0x1B87 for P104-100). 0 = success. */
+int nvml_get_pci_device_id(int idx, unsigned int *device_id);
 
 #ifdef __cplusplus
 }

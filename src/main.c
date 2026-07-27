@@ -564,6 +564,171 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
 }
 
 /* ================================================================
+ *  NVML-only fallback (no Vulkan devices at all)
+ *
+ *  Mining rigs (P104/P106 era) often run a driver whose Vulkan ICD
+ *  does not expose the cards -- vkEnumeratePhysicalDevices returns 0
+ *  even though CUDA and NVML see them fine.  When Vulkan finds
+ *  nothing, enumerate NVIDIA cards through NVML directly so the
+ *  machine's GPUs are still reported.
+ * ================================================================ */
+
+static void nvml_collect_info(GpuInfo *info, int idx)
+{
+    gpu_init_info(info);
+    strncpy(info->sensor_backend, "NVML", sizeof(info->sensor_backend) - 1);
+
+    nvml_get_name(idx, info->device_name, sizeof(info->device_name));
+    info->vendor_id   = 0x10DE;
+    info->device_type = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    {
+        unsigned int did;
+        if (nvml_get_pci_device_id(idx, &did) == 0)
+            info->device_id = did;
+    }
+
+    int temp;
+    if (nvml_get_temperature(idx, &temp) == 0)
+        info->temperature_milli_c = temp * 1000;
+
+    int gpu_pct, mem_pct;
+    if (nvml_get_utilization(idx, &gpu_pct, &mem_pct) == 0) {
+        info->utilization_gpu_pct = gpu_pct;
+        info->utilization_mem_pct = mem_pct;
+    }
+
+    int sm_mhz, mem_clk;
+    if (nvml_get_clocks(idx, &sm_mhz, &mem_clk) == 0) {
+        info->core_clock_mhz = sm_mhz;
+        if (mem_clk >= 0)
+            info->mem_clock_mhz = mem_clk;
+    }
+
+    int pwr_usage, pwr_limit;
+    if (nvml_get_power(idx, &pwr_usage, &pwr_limit) == 0) {
+        if (pwr_usage >= 0)
+            info->power_milliwatts = pwr_usage * 1000;
+        if (pwr_limit >= 0)
+            info->power_limit_milliwatts = pwr_limit * 1000;
+    }
+
+    int fan_pct;
+    if (nvml_get_fan(idx, &fan_pct) == 0)
+        info->fan_speed_pct = fan_pct;
+
+    int pstate;
+    if (nvml_get_perf_state(idx, &pstate) == 0)
+        info->perf_state = pstate;
+
+    int ecc;
+    if (nvml_get_ecc(idx, &ecc) == 0)
+        info->ecc_enabled = ecc;
+
+    unsigned int mem_used, mem_total;
+    if (nvml_get_memory(idx, &mem_used, &mem_total) == 0) {
+        info->mem_used_bytes  = (uint64_t)mem_used  * 1048576ULL;
+        info->mem_total_bytes = (uint64_t)mem_total * 1048576ULL;
+        /* Report capacity as a single device-local heap so the memory
+         * figures stay consistent with the Vulkan path. */
+        info->dedicated_vram_bytes = info->mem_total_bytes;
+        info->heap_count    = 1;
+        info->heap_sizes[0] = info->mem_total_bytes;
+        info->heap_flags[0] = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+    }
+
+    char drv_ver[64];
+    if (nvml_get_driver_version(drv_ver, sizeof(drv_ver)) == 0)
+        strncpy(info->driver_version_str, drv_ver,
+                sizeof(info->driver_version_str) - 1);
+}
+
+static void gpu_print_nvml_only_text(const GpuInfo *gpus, int count)
+{
+    int i;
+
+    printf("===== GPU Information (NVML fallback -- no Vulkan GPU) =====\n");
+    printf("(Plain C -- cross-platform + dynamic info)\n");
+    printf("=======================================================\n\n");
+
+    for (i = 0; i < count; i++) {
+        const GpuInfo *g = &gpus[i];
+        char vram_buf[64];
+        format_bytes(g->dedicated_vram_bytes, vram_buf, sizeof(vram_buf));
+
+        printf("Device %d: %s\n", i, g->device_name);
+        printf("  Vendor          : %s (0x%04X)\n",
+               vendor_name(g->vendor_id), g->vendor_id);
+        printf("  Device ID       : 0x%04X\n", g->device_id);
+        printf("  Type            : %s\n", device_type_str(g->device_type));
+        printf("  Dedicated VRAM  : %s\n", vram_buf);
+
+        printf("\n  --- NVIDIA Dynamic Info (NVML) ---\n");
+        if (g->temperature_milli_c != GPU_INFO_SENTINEL)
+            printf("  GPU Temperature : %d C\n", g->temperature_milli_c / 1000);
+        else
+            printf("  GPU Temperature : N/A\n");
+
+        if (g->utilization_gpu_pct != GPU_INFO_SENTINEL) {
+            printf("  GPU Utilization : %d%%\n", g->utilization_gpu_pct);
+            if (g->utilization_mem_pct != GPU_INFO_SENTINEL)
+                printf("  Memory Util.    : %d%%\n", g->utilization_mem_pct);
+        } else {
+            printf("  GPU Utilization : N/A\n");
+        }
+
+        if (g->core_clock_mhz != GPU_INFO_SENTINEL)
+            printf("  SM Clock        : %d MHz\n", g->core_clock_mhz);
+        else
+            printf("  SM Clock        : N/A\n");
+        if (g->mem_clock_mhz != GPU_INFO_SENTINEL)
+            printf("  Memory Clock    : %d MHz\n", g->mem_clock_mhz);
+        else
+            printf("  Memory Clock    : N/A\n");
+
+        if (g->mem_total_bytes > 0)
+            printf("  Memory Usage    : %llu / %llu MB\n",
+                   (unsigned long long)(g->mem_used_bytes  / (1024ULL * 1024ULL)),
+                   (unsigned long long)(g->mem_total_bytes / (1024ULL * 1024ULL)));
+        else
+            printf("  Memory Usage    : N/A\n");
+
+        if (g->power_milliwatts != GPU_INFO_SENTINEL &&
+            g->power_limit_milliwatts != GPU_INFO_SENTINEL)
+            printf("  Power           : %d W / %d W\n",
+                   g->power_milliwatts / 1000, g->power_limit_milliwatts / 1000);
+        else if (g->power_milliwatts != GPU_INFO_SENTINEL)
+            printf("  Power           : %d W\n", g->power_milliwatts / 1000);
+        else
+            printf("  Power           : N/A\n");
+
+        if (g->fan_speed_pct != GPU_INFO_SENTINEL)
+            printf("  Fan Speed       : %d%%\n", g->fan_speed_pct);
+        else
+            printf("  Fan Speed       : N/A\n");
+
+        if (g->perf_state != GPU_INFO_SENTINEL)
+            printf("  Perf State      : P%d\n", g->perf_state);
+        else
+            printf("  Perf State      : N/A\n");
+
+        if (g->ecc_enabled != GPU_INFO_SENTINEL)
+            printf("  ECC             : %s\n", g->ecc_enabled ? "Enabled" : "Disabled");
+        else
+            printf("  ECC             : N/A\n");
+
+        if (g->driver_version_str[0])
+            printf("  Driver Version  : %s\n", g->driver_version_str);
+        else
+            printf("  Driver Version  : N/A\n");
+
+        printf("\n");
+    }
+
+    printf("---\n");
+    printf("Total: %d GPU(s) detected (NVML fallback).\n", count);
+}
+
+/* ================================================================
  *  JSON output
  * ================================================================ */
 
@@ -1197,16 +1362,32 @@ static int do_output(int argc, char *argv[],
         sys_collect_info(&si);
     }
 
-    /* -- collect GPU data for JSON output -- */
+    /* NVML-only fallback: Vulkan found no GPU (missing/broken ICD on
+     * CUDA-only mining rigs) but NVML still sees the NVIDIA cards. */
+    int nvml_only = (instance == VK_NULL_HANDLE) &&
+                    nvml_get_device_count() > 0;
+
+    /* -- collect GPU data -- */
     GpuInfo *gpus = NULL;
-    if (!cpu_mode && !ram_mode && json_mode && instance != VK_NULL_HANDLE) {
-        gpus = (GpuInfo*)calloc((size_t)device_count, sizeof(GpuInfo));
-        if (!gpus) {
-            fprintf(stderr, "calloc failed\n");
-            return 1;
+    uint32_t gpu_count = 0;
+    if (!cpu_mode && !ram_mode) {
+        if (instance != VK_NULL_HANDLE) {
+            if (json_mode) gpu_count = device_count;
+        } else if (nvml_only) {
+            gpu_count = nvml_get_device_count();
         }
-        for (i = 0; i < device_count; i++) {
-            gpu_collect_info(&gpus[i], phys_devices[i]);
+        if (gpu_count > 0) {
+            gpus = (GpuInfo*)calloc((size_t)gpu_count, sizeof(GpuInfo));
+            if (!gpus) {
+                fprintf(stderr, "calloc failed\n");
+                return 1;
+            }
+            for (i = 0; i < gpu_count; i++) {
+                if (instance != VK_NULL_HANDLE)
+                    gpu_collect_info(&gpus[i], phys_devices[i]);
+                else
+                    nvml_collect_info(&gpus[i], (int)i);
+            }
         }
     }
 
@@ -1763,6 +1944,10 @@ static int do_output(int argc, char *argv[],
         printf("---\n");
         printf("Total: %u GPU(s) detected.\n", total);
     }
+    /* NVML-only fallback text output */
+    else if (!cpu_mode && !ram_mode && !json_mode && nvml_only) {
+        gpu_print_nvml_only_text(gpus, (int)gpu_count);
+    }
 
     /* -- system info output -- */
     if (cpu_mode || ram_mode) {
@@ -1774,8 +1959,8 @@ static int do_output(int argc, char *argv[],
         }
     } else if (memory_only) {
         if (json_mode) {
-            if (instance != VK_NULL_HANDLE)
-                print_memory_json(&si, gpus, (int)device_count);
+            if (instance != VK_NULL_HANDLE || nvml_only)
+                print_memory_json(&si, gpus, (int)gpu_count);
             else
                 print_memory_json(&si, NULL, 0);
         } else {
@@ -1784,16 +1969,16 @@ static int do_output(int argc, char *argv[],
         }
     } else if (!gpu_only) {
         if (json_mode) {
-            if (instance != VK_NULL_HANDLE)
-                print_all_json(&si, gpus, (int)device_count);
+            if (instance != VK_NULL_HANDLE || nvml_only)
+                print_all_json(&si, gpus, (int)gpu_count);
             else
                 sys_print_json(&si);
         } else {
             putchar('\n');
             sys_print_text(&si);
         }
-    } else if (json_mode && instance != VK_NULL_HANDLE) {
-        print_gpu_json(gpus, (int)device_count);
+    } else if (json_mode && (instance != VK_NULL_HANDLE || nvml_only)) {
+        print_gpu_json(gpus, (int)gpu_count);
     }
 
     free(gpus);
@@ -1869,6 +2054,15 @@ static void repl_loop(VkInstance instance,
  *  Main
  * ================================================================ */
 
+/* NVML-only fallback availability: Vulkan enumerates no GPU at all
+ * (missing/broken ICD — typical on CUDA-only mining rigs), while NVML
+ * still sees the NVIDIA cards. */
+static int nvml_fallback_available(void)
+{
+    nvml_set_diag(1);  /* loud failure reasons when we actually need NVML */
+    return nvml_init() == 0 && nvml_get_device_count() > 0;
+}
+
 int main(int argc, char *argv[])
 {
 #ifdef _WIN32
@@ -1930,7 +2124,7 @@ int main(int argc, char *argv[])
 
     if (need_vulkan) {
         if (vulkan_backend_init() != 0) {
-            if (gpu_only) {
+            if (gpu_only && !nvml_fallback_available()) {
                 fprintf(stderr, "GPU-only mode requested but Vulkan loader is not available.\n");
                 return 1;
             }
@@ -2001,7 +2195,7 @@ int main(int argc, char *argv[])
                         "Make sure a Vulkan driver is installed.\n"
                         "  Windows: install GPU vendor driver (NVIDIA/AMD/Intel)\n"
                         "  Linux:   apt install vulkan-tools / mesa-vulkan-drivers\n");
-                if (gpu_only) {
+                if (gpu_only && !nvml_fallback_available()) {
                     fprintf(stderr, "GPU-only mode requested but no GPU is available.\n");
                     return 1;
                 }
@@ -2025,7 +2219,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Warning: No Vulkan-capable GPU found.\n");
             vkDestroyInstance(instance, NULL);
             instance = VK_NULL_HANDLE;
-            if (gpu_only) {
+            if (gpu_only && !nvml_fallback_available()) {
                 return 1;
             }
         }
@@ -2063,6 +2257,11 @@ int main(int argc, char *argv[])
                 char     name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
             } seen[32];
             uint32_t s;
+            /* Track what the llvmpipe filter drops, so we can tell
+             * "Vulkan saw only software devices" apart from "Vulkan
+             * saw nothing" below. */
+            char filtered[8][VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+            uint32_t filtered_count = 0;
 
             for (i = 0; i < device_count; i++) {
                 VkPhysicalDeviceProperties2 props2 = {0};
@@ -2071,7 +2270,16 @@ int main(int argc, char *argv[])
                 int pci_valid, is_dup = 0;
 
                 vkGetPhysicalDeviceProperties(phys_devices[i], &props);
-                if (strstr(props.deviceName, "llvmpipe")) continue;
+                if (strstr(props.deviceName, "llvmpipe")) {
+                    if (filtered_count < 8) {
+                        strncpy(filtered[filtered_count], props.deviceName,
+                                VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1);
+                        filtered[filtered_count]
+                                [VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1] = '\0';
+                        filtered_count++;
+                    }
+                    continue;
+                }
 
                 /* Query PCI bus info for dedup (same extension already
                  * used in gpu_collect_info).  If the extension is
@@ -2128,12 +2336,38 @@ int main(int argc, char *argv[])
                 keep++;
             }
             device_count = keep;
+
+            /* Everything Vulkan enumerated was filtered out (e.g. only
+             * llvmpipe software rendering on a rig whose NVIDIA ICD is
+             * not registered).  Treat it exactly like "no Vulkan GPU"
+             * so the NVML fallback below can take over. */
+            if (device_count == 0 && filtered_count > 0) {
+                uint32_t f;
+                for (f = 0; f < filtered_count; f++)
+                    fprintf(stderr, "[gpu-info] ignoring software Vulkan device: %s\n",
+                            filtered[f]);
+                vkDestroyInstance(instance, NULL);
+                instance = VK_NULL_HANDLE;
+                free(phys_devices);
+                phys_devices = NULL;
+            }
         }
     }
 
     /* -- dispatch -- */
+    /* NVML-only fallback notice (stderr only; stdout stays clean for
+     * JSON consumers).  Reached when Vulkan enumerated nothing, or
+     * everything it enumerated was filtered out above. */
+    if (instance == VK_NULL_HANDLE && need_vulkan &&
+        nvml_fallback_available()) {
+        fprintf(stderr,
+                "[gpu-info] Vulkan reported no GPU; using NVML-only enumeration (%u device%s)\n",
+                nvml_get_device_count(),
+                nvml_get_device_count() > 1 ? "s" : "");
+    }
+
     if (interactive) {
-        if (instance == VK_NULL_HANDLE) {
+        if (instance == VK_NULL_HANDLE && nvml_get_device_count() == 0) {
             printf("Interactive mode — no Vulkan GPU detected, system info only.\n");
         } else {
             printf("Interactive mode. Type --help for commands, --exit to quit.\n");

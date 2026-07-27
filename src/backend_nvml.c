@@ -118,6 +118,7 @@ typedef int (*PFN_nvmlDeviceGetFanSpeed)(nvmlDevice_t, unsigned int*);
 typedef int (*PFN_nvmlDeviceGetPerformanceState)(nvmlDevice_t, int*);
 typedef int (*PFN_nvmlDeviceGetEccMode)(nvmlDevice_t, int*, int*);
 typedef int (*PFN_nvmlSystemGetDriverVersion)(char*, unsigned int);
+typedef int (*PFN_nvmlDeviceGetName)(nvmlDevice_t, char*, unsigned int);
 
 /* ------------------------------------------------------------------
  *  Static state
@@ -125,9 +126,23 @@ typedef int (*PFN_nvmlSystemGetDriverVersion)(char*, unsigned int);
 
 #ifdef _WIN32
 static HMODULE g_lib = NULL;
-#define LOAD_LIB()   LoadLibraryA("nvml.dll")
 #define GET_FN(l, n) GetProcAddress((HMODULE)(l), n)
 #define FREE_LIB(l)  FreeLibrary((HMODULE)(l))
+
+/* Older drivers (typical on mining rigs) may not copy nvml.dll into
+ * System32 -- nvidia-smi still works because it ships next to the DLL
+ * under NVSMI.  Try the plain name first, then the known absolute
+ * locations. */
+static HMODULE nvml_load_lib(void)
+{
+    HMODULE lib = LoadLibraryA("nvml.dll");
+    if (!lib)
+        lib = LoadLibraryA("C:\\Windows\\System32\\nvml.dll");
+    if (!lib)
+        lib = LoadLibraryA("C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+    return lib;
+}
+#define LOAD_LIB() nvml_load_lib()
 #else
 static void *g_lib = NULL;
 #define GET_FN(l, n) dlsym((l), n)
@@ -147,6 +162,10 @@ static void *nvml_load_lib(void)
 #endif
 
 static int g_init_ok = 0;
+static int g_diag = 0;          /* print init failure reasons to stderr */
+static int g_diag_reported = 0; /* only report once */
+
+void nvml_set_diag(int on) { g_diag = on; }
 
 static PFN_nvmlInit_v2                       pfn_Init = NULL;
 static PFN_nvmlShutdown                      pfn_Shutdown = NULL;
@@ -165,12 +184,14 @@ static PFN_nvmlDeviceGetFanSpeed             pfn_GetFan = NULL;
 static PFN_nvmlDeviceGetPerformanceState     pfn_GetPState = NULL;
 static PFN_nvmlDeviceGetEccMode              pfn_GetEcc = NULL;
 static PFN_nvmlSystemGetDriverVersion        pfn_DrvVer = NULL;
+static PFN_nvmlDeviceGetName                 pfn_GetName = NULL;
 
 typedef struct {
     unsigned int domain;
     unsigned int bus;
     unsigned int device;
     unsigned int function;
+    unsigned int pci_device_id;  /* raw pciDeviceId: (device << 16) | vendor */
     int          valid;
 } NvmlPciInfo;
 
@@ -194,20 +215,38 @@ int nvml_init(void)
     unsigned int i;
 
     if (g_init_ok)  return 0;
-    if (g_init_ok < 0) return -1;
+    if (g_init_ok < 0) {
+        /* A previous probe failed silently (diag was off).  When the
+         * caller later enables diagnostics, retry once so the actual
+         * failure reason gets printed. */
+        if (g_diag && !g_diag_reported) g_init_ok = 0;
+        else return -1;
+    }
 
     g_lib = LOAD_LIB();
-    if (!g_lib) { g_init_ok = -1; return -1; }
+    if (!g_lib) {
+        if (g_diag) {
+            fprintf(stderr, "[gpu-info] NVML: nvml library not found "
+                            "(nvml.dll / libnvidia-ml.so.1)\n");
+            g_diag_reported = 1;
+        }
+        g_init_ok = -1;
+        return -1;
+    }
 
     if (!RESOLVE(pfn_Init, "nvmlInit_v2") &&
         !RESOLVE(pfn_Init, "nvmlInit")) {
+        if (g_diag) {
+            fprintf(stderr, "[gpu-info] NVML: nvmlInit symbol not found\n");
+            g_diag_reported = 1;
+        }
         FREE_LIB(g_lib); g_lib = NULL; g_init_ok = -1; return -1;
     }
-    if (!RESOLVE(pfn_Shutdown, "nvmlShutdown")) goto fail;
+    if (!RESOLVE(pfn_Shutdown, "nvmlShutdown")) goto fail_sym;
     if (!RESOLVE(pfn_GetCount, "nvmlDeviceGetCount_v2") &&
-        !RESOLVE(pfn_GetCount, "nvmlDeviceGetCount")) goto fail;
+        !RESOLVE(pfn_GetCount, "nvmlDeviceGetCount")) goto fail_sym;
     if (!RESOLVE(pfn_GetHandleByIndex, "nvmlDeviceGetHandleByIndex_v2") &&
-        !RESOLVE(pfn_GetHandleByIndex, "nvmlDeviceGetHandleByIndex")) goto fail;
+        !RESOLVE(pfn_GetHandleByIndex, "nvmlDeviceGetHandleByIndex")) goto fail_sym;
     /* GetPciInfo is needed for matching identical GPU models.
      * v3 is canonical since ~2014; fall back to v2/v1 for older drivers. */
     if (!RESOLVE(pfn_GetPciInfo, "nvmlDeviceGetPciInfo_v3") &&
@@ -228,12 +267,26 @@ int nvml_init(void)
     RESOLVE(pfn_GetPState,    "nvmlDeviceGetPerformanceState");
     RESOLVE(pfn_GetEcc,       "nvmlDeviceGetEccMode");
     RESOLVE(pfn_DrvVer,       "nvmlSystemGetDriverVersion");
+    RESOLVE(pfn_GetName,      "nvmlDeviceGetName");
 
     r = pfn_Init();
-    if (r != NVML_SUCCESS) { goto fail; }
+    if (r != NVML_SUCCESS) {
+        if (g_diag) {
+            fprintf(stderr, "[gpu-info] NVML: nvmlInit failed, r=%d\n", r);
+            g_diag_reported = 1;
+        }
+        goto fail;
+    }
 
     r = pfn_GetCount(&g_num_devices);
-    if (r != NVML_SUCCESS || g_num_devices == 0) { goto fail; }
+    if (r != NVML_SUCCESS || g_num_devices == 0) {
+        if (g_diag) {
+            fprintf(stderr, "[gpu-info] NVML: GetDeviceCount failed, r=%d count=%u\n",
+                    r, g_num_devices);
+            g_diag_reported = 1;
+        }
+        goto fail;
+    }
     if (g_num_devices > NVML_MAX_DEVICES) g_num_devices = NVML_MAX_DEVICES;
 
     for (i = 0; i < g_num_devices; i++) {
@@ -242,17 +295,24 @@ int nvml_init(void)
         r = pfn_GetHandleByIndex(i, &g_devices[i]);
         if (r != NVML_SUCCESS) continue;
         if (pfn_GetPciInfo && pfn_GetPciInfo(g_devices[i], &pci) == NVML_SUCCESS) {
-            g_pci_info[i].domain   = pci.domain;
-            g_pci_info[i].bus      = pci.bus;
-            g_pci_info[i].device   = pci.device;
-            g_pci_info[i].function = 0;  /* GPU is always function 0; NVML has no function field */
-            g_pci_info[i].valid    = 1;
+            g_pci_info[i].domain        = pci.domain;
+            g_pci_info[i].bus           = pci.bus;
+            g_pci_info[i].device        = pci.device;
+            g_pci_info[i].function      = 0;  /* GPU is always function 0; NVML has no function field */
+            g_pci_info[i].pci_device_id = pci.pciDeviceId;
+            g_pci_info[i].valid         = 1;
         }
     }
 
     g_init_ok = 1;
     return 0;
 
+fail_sym:
+    if (g_diag) {
+        fprintf(stderr, "[gpu-info] NVML: required symbol missing "
+                        "(Shutdown/GetCount/GetHandleByIndex)\n");
+        g_diag_reported = 1;
+    }
 fail:
     FREE_LIB(g_lib);
     g_lib = NULL;
@@ -496,5 +556,32 @@ int nvml_get_driver_version(char *buf, size_t buf_size)
     if (g_init_ok <= 0) return -1;
     if (!pfn_DrvVer) return -1;
     if (pfn_DrvVer(buf, (unsigned int)buf_size) != NVML_SUCCESS) return -1;
+    return 0;
+}
+
+unsigned int nvml_get_device_count(void)
+{
+    if (g_init_ok <= 0) return 0;
+    return g_num_devices;
+}
+
+int nvml_get_name(int idx, char *buf, size_t buf_size)
+{
+    char tmp[64];  /* NVML_DEVICE_NAME_V2_BUFFER_SIZE */
+    CHECK(idx);
+    if (!pfn_GetName || !buf || buf_size == 0) return -1;
+    memset(tmp, 0, sizeof(tmp));
+    if (pfn_GetName(g_devices[idx], tmp, sizeof(tmp)) != NVML_SUCCESS)
+        return -1;
+    strncpy(buf, tmp, buf_size - 1);
+    buf[buf_size - 1] = '\0';
+    return 0;
+}
+
+int nvml_get_pci_device_id(int idx, unsigned int *device_id)
+{
+    CHECK(idx);
+    if (!g_pci_info[idx].valid) return -1;
+    *device_id = g_pci_info[idx].pci_device_id >> 16;  /* low half = vendor */
     return 0;
 }
