@@ -331,7 +331,14 @@ int sysfs_get_power(int idx, int *milliwatts)
         return -1;
 
     if (g_gpus[idx].hwmon_path[0]) {
+        /* try power1_average first (standard amdgpu) */
         make_path(p, sizeof(p), g_gpus[idx].hwmon_path, "power1_average");
+        if (read_ull(p, &val) == 0) {
+            *milliwatts = (int)(val / 1000ULL); /* uW -> mW */
+            return 0;
+        }
+        /* fallback: power1_input (some older AMD GPUs / Vega20) */
+        make_path(p, sizeof(p), g_gpus[idx].hwmon_path, "power1_input");
         if (read_ull(p, &val) == 0) {
             *milliwatts = (int)(val / 1000ULL); /* uW -> mW */
             return 0;
