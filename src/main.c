@@ -308,11 +308,18 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
                 if (act_mask & ADL_ACT_VALID_PERF_LEVEL)
                     info->perf_state = lvl;
             }
-            if ((act_mask <= 0 || (act_mask & ADL_ACT_VALID_ACTIVITY) == 0) &&
-                id_props.deviceLUIDValid) {
-                /* AMD iGPU/APU fallback: Windows PDH GPU Engine counters */
+            if (id_props.deviceLUIDValid &&
+                (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+                 act_mask <= 0 || (act_mask & ADL_ACT_VALID_ACTIVITY) == 0)) {
+                /* Windows PDH GPU Engine counters: windowed over ~200 ms
+                 * and covering all engine types (3D/compute/copy/video).
+                 * PMLog's INFO_ACTIVITY_GFX is an instantaneous 3D-only
+                 * sample that reads 0 under bursty desktop/video load,
+                 * so on iGPUs always consult PDH and keep the larger. */
                 int util;
-                if (winmem_get_utilization(luid_low, luid_high, &util) == 0) {
+                if (winmem_get_utilization(luid_low, luid_high, &util) == 0 &&
+                    (info->utilization_gpu_pct == GPU_INFO_SENTINEL ||
+                     util > info->utilization_gpu_pct)) {
                     info->utilization_gpu_pct = util;
                 }
             }
@@ -1318,19 +1325,31 @@ static int do_output(int argc, char *argv[],
                     {
                         int act_mask = adl_get_activity(adl_idx, &eng,
                                                         &mem_clk, &act, &lvl);
-                        int printed_util = 0;
+                        int util_val = -1;
+                        const char *util_src = NULL;
                         if (act_mask > 0 && (act_mask & ADL_ACT_VALID_ACTIVITY)) {
-                            printf("  GPU Utilization : %d%%\n", act);
-                            printed_util = 1;
-                        } else if (amd_id.deviceLUIDValid) {
+                            util_val = act;
+                            util_src = "ADL";
+                        }
+                        /* PDH is windowed and covers all engine types;
+                         * PMLog activity is an instantaneous 3D-only
+                         * sample that reads 0 under bursty/video load.
+                         * On iGPUs consult PDH always and keep the max. */
+                        if (amd_id.deviceLUIDValid &&
+                            (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+                             util_val < 0)) {
                             int u;
                             if (winmem_get_utilization(amd_luid_low,
-                                                       amd_luid_high, &u) == 0) {
-                                printf("  GPU Utilization : %d%% (PDH)\n", u);
-                                printed_util = 1;
+                                                       amd_luid_high, &u) == 0 &&
+                                u > util_val) {
+                                util_val = u;
+                                util_src = "PDH";
                             }
                         }
-                        if (!printed_util)
+                        if (util_val >= 0)
+                            printf("  GPU Utilization : %d%% (%s)\n",
+                                   util_val, util_src);
+                        else
                             printf("  GPU Utilization : N/A\n");
 
                         if (act_mask > 0 && (act_mask & ADL_ACT_VALID_ENG_CLOCK))
