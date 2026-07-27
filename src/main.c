@@ -22,8 +22,24 @@
 #define vkDestroyInstance               vulkan_DestroyInstance
 #define vkEnumeratePhysicalDevices      vulkan_EnumeratePhysicalDevices
 #define vkGetPhysicalDeviceProperties   vulkan_GetPhysicalDeviceProperties
-#define vkGetPhysicalDeviceProperties2  vulkan_GetPhysicalDeviceProperties2
 #define vkGetPhysicalDeviceMemoryProperties vulkan_GetPhysicalDeviceMemoryProperties
+
+/* vkGetPhysicalDeviceProperties2 is core only since Vulkan 1.1.  On a
+ * Vulkan 1.0 instance (old loader/driver) without
+ * VK_KHR_get_physical_device_properties2 the pointer stays NULL; fall
+ * back to plain vkGetPhysicalDeviceProperties and leave the chained
+ * structs (PCI bus info, LUID) zeroed -- downstream code already treats
+ * zeroed PCI/LUID as "info unavailable". */
+static void gpuinfo_get_physical_device_properties2(
+    VkPhysicalDevice device, VkPhysicalDeviceProperties2 *props2)
+{
+    if (vulkan_GetPhysicalDeviceProperties2) {
+        vulkan_GetPhysicalDeviceProperties2(device, props2);
+    } else {
+        vulkan_GetPhysicalDeviceProperties(device, &props2->properties);
+    }
+}
+#define vkGetPhysicalDeviceProperties2  gpuinfo_get_physical_device_properties2
 
 /* ================================================================
  *  Utility helpers
@@ -1934,6 +1950,51 @@ int main(int argc, char *argv[])
             instance_ci.pApplicationInfo = &app_info;
 
             vkres = vkCreateInstance(&instance_ci, NULL, &instance);
+
+            /* Old drivers (typical on mining rigs, e.g. a P104 with a
+             * pre-2018 NVIDIA driver) ship a Vulkan 1.0-only loader, and
+             * requesting a 1.1 instance fails with
+             * VK_ERROR_INCOMPATIBLE_DRIVER -- making every GPU vanish
+             * from the output even though CUDA/NVML see them fine.
+             * Fall back to a 1.0 instance; vkGetPhysicalDeviceProperties2
+             * is then re-resolved via VK_KHR_get_physical_device_properties2
+             * (supported by NVIDIA/AMD/Intel drivers since Vulkan 1.0). */
+            if (vkres == VK_ERROR_INCOMPATIBLE_DRIVER) {
+                const char *props2_ext =
+                    VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
+                int have_props2_ext = 0;
+                if (vulkan_EnumerateInstanceExtensionProperties) {
+                    uint32_t ext_count = 0;
+                    if (vulkan_EnumerateInstanceExtensionProperties(
+                            NULL, &ext_count, NULL) == VK_SUCCESS &&
+                        ext_count > 0) {
+                        VkExtensionProperties *exts = (VkExtensionProperties*)
+                            malloc(ext_count * sizeof(VkExtensionProperties));
+                        if (exts) {
+                            uint32_t e;
+                            if (vulkan_EnumerateInstanceExtensionProperties(
+                                    NULL, &ext_count, exts) == VK_SUCCESS) {
+                                for (e = 0; e < ext_count; e++) {
+                                    if (strcmp(exts[e].extensionName,
+                                               props2_ext) == 0) {
+                                        have_props2_ext = 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            free(exts);
+                        }
+                    }
+                }
+                app_info.apiVersion = VK_API_VERSION_1_0;
+                instance_ci.enabledExtensionCount   = have_props2_ext ? 1 : 0;
+                instance_ci.ppEnabledExtensionNames = have_props2_ext
+                    ? &props2_ext : NULL;
+                vkres = vkCreateInstance(&instance_ci, NULL, &instance);
+            }
+            if (vkres == VK_SUCCESS)
+                vulkan_backend_resolve_properties2(instance);
+
             if (vkres != VK_SUCCESS) {
                 fprintf(stderr, "Warning: vkCreateInstance failed: %d\n", vkres);
                 fprintf(stderr,

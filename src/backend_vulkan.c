@@ -34,6 +34,8 @@ PFN_vkEnumeratePhysicalDevices      vulkan_EnumeratePhysicalDevices = NULL;
 PFN_vkGetPhysicalDeviceProperties   vulkan_GetPhysicalDeviceProperties = NULL;
 PFN_vkGetPhysicalDeviceProperties2  vulkan_GetPhysicalDeviceProperties2 = NULL;
 PFN_vkGetPhysicalDeviceMemoryProperties vulkan_GetPhysicalDeviceMemoryProperties = NULL;
+PFN_vkGetInstanceProcAddr           vulkan_GetInstanceProcAddr = NULL;
+PFN_vkEnumerateInstanceExtensionProperties vulkan_EnumerateInstanceExtensionProperties = NULL;
 
 int vulkan_backend_init(void)
 {
@@ -50,12 +52,16 @@ int vulkan_backend_init(void)
     vulkan_DestroyInstance = (PFN_vkDestroyInstance)GET_FN(g_vulkan_lib, "vkDestroyInstance");
     vulkan_EnumeratePhysicalDevices = (PFN_vkEnumeratePhysicalDevices)GET_FN(g_vulkan_lib, "vkEnumeratePhysicalDevices");
     vulkan_GetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)GET_FN(g_vulkan_lib, "vkGetPhysicalDeviceProperties");
+    /* Core since Vulkan 1.1 only -- a 1.0-era loader does not export it.
+     * Not fatal: vulkan_backend_resolve_properties2() retries per-instance. */
     vulkan_GetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)GET_FN(g_vulkan_lib, "vkGetPhysicalDeviceProperties2");
     vulkan_GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)GET_FN(g_vulkan_lib, "vkGetPhysicalDeviceMemoryProperties");
+    vulkan_GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)GET_FN(g_vulkan_lib, "vkGetInstanceProcAddr");
+    vulkan_EnumerateInstanceExtensionProperties = (PFN_vkEnumerateInstanceExtensionProperties)GET_FN(g_vulkan_lib, "vkEnumerateInstanceExtensionProperties");
 
     if (!vulkan_CreateInstance || !vulkan_DestroyInstance ||
         !vulkan_EnumeratePhysicalDevices || !vulkan_GetPhysicalDeviceProperties ||
-        !vulkan_GetPhysicalDeviceProperties2 || !vulkan_GetPhysicalDeviceMemoryProperties) {
+        !vulkan_GetPhysicalDeviceMemoryProperties) {
         FREE_LIB(g_vulkan_lib);
         g_vulkan_lib = NULL;
         return -1;
@@ -63,6 +69,18 @@ int vulkan_backend_init(void)
 
     g_loaded = 1;
     return 0;
+}
+
+void vulkan_backend_resolve_properties2(VkInstance instance)
+{
+    if (vulkan_GetPhysicalDeviceProperties2 || !vulkan_GetInstanceProcAddr)
+        return;
+    vulkan_GetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)
+        vulkan_GetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties2");
+    if (!vulkan_GetPhysicalDeviceProperties2) {
+        vulkan_GetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)
+            vulkan_GetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties2KHR");
+    }
 }
 
 void vulkan_backend_shutdown(void)
@@ -77,6 +95,8 @@ void vulkan_backend_shutdown(void)
     vulkan_GetPhysicalDeviceProperties = NULL;
     vulkan_GetPhysicalDeviceProperties2 = NULL;
     vulkan_GetPhysicalDeviceMemoryProperties = NULL;
+    vulkan_GetInstanceProcAddr = NULL;
+    vulkan_EnumerateInstanceExtensionProperties = NULL;
     g_loaded = 0;
 }
 
