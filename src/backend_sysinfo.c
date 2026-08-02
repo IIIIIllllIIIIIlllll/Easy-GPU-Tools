@@ -179,7 +179,18 @@ int sys_collect_ram_info(SysInfo *info)
             uint64_t pagefile_total = memx.ullTotalPageFile;
             uint64_t pagefile_avail = memx.ullAvailPageFile;
 
-            info->memory_total_bytes = memx.ullTotalPhys;
+            /* ullTotalPhys excludes hardware-reserved RAM (firmware,
+             * iGPU carve-out), so machines with an integrated GPU show
+             * less than the installed amount.  Prefer the physically
+             * installed figure; fall back to the OS-usable one. */
+            {
+                ULONGLONG installed_kb = 0;
+                if (GetPhysicallyInstalledSystemMemory(&installed_kb) &&
+                    installed_kb > 0)
+                    info->memory_total_bytes = (uint64_t)installed_kb * 1024;
+                else
+                    info->memory_total_bytes = memx.ullTotalPhys;
+            }
             info->memory_used_bytes  = memx.ullTotalPhys - memx.ullAvailPhys;
 
             if (pagefile_total > memx.ullTotalPhys) {
@@ -205,6 +216,7 @@ int sys_collect_disk_info(SysInfo *info)
     {
         DWORD drives = GetLogicalDrives();
         int d;
+        info->disk_count = 0;   /* allow re-collection on the same struct */
         for (d = 0; d < 26 && info->disk_count < SYS_INFO_MAX_DISKS; d++) {
             if (!(drives & (1 << d))) continue;
 
@@ -268,6 +280,8 @@ int sys_collect_info(SysInfo *info)
 #include <sys/statvfs.h>
 #include <mntent.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <ctype.h>
 
 static int read_proc_line(const char *path, const char *key,
                           char *val, size_t val_size)
@@ -409,6 +423,52 @@ int sys_collect_cpu_info(SysInfo *info)
     return 0;
 }
 
+/* MemTotal excludes kernel-reserved and hardware-reserved RAM (firmware,
+ * iGPU stolen memory), so machines with an integrated GPU show less than
+ * the installed amount.  Sum the online blocks under
+ * /sys/devices/system/memory (same approach as lsmem) to get the
+ * physically installed figure.  Returns 0 when unavailable. */
+static uint64_t linux_installed_ram_bytes(void)
+{
+    uint64_t block = 0, total = 0;
+    char buf[64];
+    FILE *f;
+    DIR *d;
+    struct dirent *de;
+
+    f = fopen("/sys/devices/system/memory/block_size_bytes", "r");
+    if (!f) return 0;
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    block = strtoull(buf, NULL, 0);   /* value is hex, e.g. 0x8000000 */
+    if (block == 0) return 0;
+
+    d = opendir("/sys/devices/system/memory");
+    if (!d) return 0;
+    while ((de = readdir(d)) != NULL) {
+        char path[512];
+        if (strncmp(de->d_name, "memory", 6) != 0 ||
+            !isdigit((unsigned char)de->d_name[6]))
+            continue;
+        /* skip offline blocks; a missing "online" file means the block
+         * is not hot-removable, i.e. permanently online */
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/memory/%s/online", de->d_name);
+        f = fopen(path, "r");
+        if (f) {
+            int c = fgetc(f);
+            fclose(f);
+            if (c == '0') continue;
+        }
+        total += block;
+    }
+    closedir(d);
+    return total;
+}
+
 int sys_collect_ram_info(SysInfo *info)
 {
     /* ---- RAM ---------------------------------------------------------- */
@@ -419,7 +479,12 @@ int sys_collect_ram_info(SysInfo *info)
         long long swapf = read_proc_val("/proc/meminfo", "SwapFree");
 
         if (total > 0) {
-            info->memory_total_bytes = (uint64_t)total * 1024;
+            uint64_t installed = linux_installed_ram_bytes();
+            info->memory_total_bytes = installed > 0
+                ? installed : (uint64_t)total * 1024;
+            /* MemAvailable is absent on kernels < 3.14 */
+            if (avail < 0)
+                avail = read_proc_val("/proc/meminfo", "MemFree");
             if (avail > 0)
                 info->memory_used_bytes = (uint64_t)(total - avail) * 1024;
         }
@@ -438,8 +503,12 @@ int sys_collect_disk_info(SysInfo *info)
     /* ---- Disk --------------------------------------------------------- */
     {
         FILE *f = setmntent("/proc/mounts", "r");
+        info->disk_count = 0;   /* allow re-collection on the same struct */
         if (f) {
             struct mntent *ent;
+            /* full device paths already listed, for de-duplication */
+            char seen[SYS_INFO_MAX_DISKS][128];
+            int n_seen = 0;
             const char *real_fs[] = {
                 "ext2","ext3","ext4","xfs","btrfs","zfs",
                 "ntfs","ntfs3","vfat","fuseblk","f2fs",
@@ -448,13 +517,32 @@ int sys_collect_disk_info(SysInfo *info)
             while ((ent = getmntent(f))
                    && info->disk_count < SYS_INFO_MAX_DISKS) {
                 const char **fs;
-                int ok = 0;
+                int ok = 0, dup = 0, j;
                 for (fs = real_fs; *fs; fs++) {
                     if (strcmp(ent->mnt_type, *fs) == 0) {
                         ok = 1; break;
                     }
                 }
                 if (!ok) continue;
+
+                /* the same device may appear many times in /proc/mounts
+                 * (btrfs subvolumes, bind mounts) -- keep only the first */
+                for (j = 0; j < n_seen; j++) {
+                    if (strcmp(seen[j], ent->mnt_fsname) == 0) {
+                        dup = 1; break;
+                    }
+                }
+                if (dup) continue;
+
+                /* skip unreachable/stale mounts instead of emitting a
+                 * bogus 0 B / 0 B entry */
+                struct statvfs sv;
+                if (statvfs(ent->mnt_dir, &sv) != 0) continue;
+
+                strncpy(seen[n_seen], ent->mnt_fsname,
+                        sizeof(seen[n_seen]) - 1);
+                seen[n_seen][sizeof(seen[n_seen]) - 1] = '\0';
+                n_seen++;
 
                 int idx = info->disk_count;
                 strncpy(info->disks[idx].filesystem, ent->mnt_type,
@@ -470,13 +558,10 @@ int sys_collect_disk_info(SysInfo *info)
                             sizeof(info->disks[idx].name) - 1);
                 }
 
-                struct statvfs sv;
-                if (statvfs(ent->mnt_dir, &sv) == 0) {
-                    info->disks[idx].total_bytes =
-                        (uint64_t)sv.f_frsize * sv.f_blocks;
-                    info->disks[idx].used_bytes =
-                        (uint64_t)sv.f_frsize * (sv.f_blocks - sv.f_bfree);
-                }
+                info->disks[idx].total_bytes =
+                    (uint64_t)sv.f_frsize * sv.f_blocks;
+                info->disks[idx].used_bytes =
+                    (uint64_t)sv.f_frsize * (sv.f_blocks - sv.f_bfree);
 
                 info->disk_count++;
             }
