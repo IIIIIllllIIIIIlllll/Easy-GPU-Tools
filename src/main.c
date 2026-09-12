@@ -10,6 +10,7 @@
 #include "gpu_info.h"
 #include "sys_info.h"
 #include "backend_adl.h"
+#include "backend_adlx.h"
 #include "backend_sysfs.h"
 #include "backend_nvml.h"
 #include "backend_intel.h"
@@ -281,9 +282,84 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
                         sizeof(info->driver_version_str) - 1);
         }
     }
-    /* -- AMD: ADL (Windows) / sysfs (Linux) --------------------------- */
+    /* -- AMD: ADLX (preferred) / ADL (Windows) / sysfs (Linux) -------- */
     else if (props.vendorID == 0x1002) {
 #if defined(_WIN32)
+        /* ADLX is tried first: ADL2 sensor queries return nothing on
+         * RDNA4 (RX 9070 series); ADLX is the driver's supported
+         * telemetry path there.  Falls back to legacy ADL below. */
+        int adlx_idx;
+        if (adlx_find_by_pci_topology(pci_props.pciDomain, pci_props.pciBus,
+                                      pci_props.pciDevice,
+                                      pci_props.pciFunction,
+                                      &adlx_idx) != 0 &&
+            adlx_find_by_pci(props.vendorID, props.deviceID, &adlx_idx) != 0) {
+            adlx_idx = -1;
+        }
+        if (adlx_idx >= 0) {
+            strncpy(info->sensor_backend, "ADLX", sizeof(info->sensor_backend) - 1);
+
+            int t;
+            if (adlx_get_temperature(adlx_idx, &t) == 0)
+                info->temperature_milli_c = t;
+
+            int rpm, pct;
+            if (adlx_get_fan_speed(adlx_idx, &rpm, &pct) == 0) {
+                info->fan_speed_rpm = rpm;
+                if (pct >= 0)
+                    info->fan_speed_pct = pct;
+            }
+
+            int util;
+            if (adlx_get_utilization(adlx_idx, &util) == 0)
+                info->utilization_gpu_pct = util;
+
+            int core_mhz, mem_mhz;
+            if (adlx_get_clocks(adlx_idx, &core_mhz, &mem_mhz) == 0) {
+                if (core_mhz > 0)
+                    info->core_clock_mhz = core_mhz;
+                if (mem_mhz > 0)
+                    info->mem_clock_mhz = mem_mhz;
+            }
+
+            int pwr;
+            if (adlx_get_power(adlx_idx, &pwr) == 0 && pwr > 0)
+                info->power_milliwatts = pwr;
+
+            uint64_t vram_used = 0, vram_total = 0;
+            if (adlx_get_memory(adlx_idx, &vram_used, &vram_total) == 0) {
+                if (vram_used > 0)
+                    info->mem_used_bytes = vram_used;
+                if (vram_total > 0)
+                    info->mem_total_bytes = vram_total;
+            }
+
+            /* PDH covers utilization when ADLX has no usage sensor. */
+            if (id_props.deviceLUIDValid &&
+                info->utilization_gpu_pct == GPU_INFO_SENTINEL) {
+                int u;
+                if (winmem_get_utilization(luid_low, luid_high, &u) == 0)
+                    info->utilization_gpu_pct = u;
+            }
+
+            /* iGPU memory correction, same as in the ADL path below */
+            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                uint64_t vt = info->dedicated_vram_bytes + info->shared_ram_bytes;
+                if (vt > info->mem_total_bytes)
+                    info->mem_total_bytes = vt;
+
+                if (id_props.deviceLUIDValid) {
+                    uint64_t ded = 0, sha = 0;
+                    if (winmem_get_memory(luid_low, luid_high,
+                                          &ded, &sha, NULL) == 0) {
+                        info->mem_used_bytes = sha + ded;
+                    }
+                }
+            }
+        }
+        /* Legacy ADL backend: on ASICs where ADLX is unavailable or did
+         * not match a device. */
+        else {
         int adl_idx;
         /* Prefer PCI topology so two identical AMD GPUs don't collapse
          * onto adapter 0; fall back to vendor/device then name. */
@@ -375,6 +451,7 @@ static void gpu_collect_info(GpuInfo *info, VkPhysicalDevice device)
                 }
             }
         }
+        } /* -- end legacy ADL fallback -- */
 #elif defined(__linux__)
         int s_idx;
         /* Prefer PCI topology so two identical AMD GPUs don't collapse
@@ -1495,6 +1572,70 @@ static int do_output(int argc, char *argv[],
                                     ((uint32_t)amd_id.deviceLUID[7] << 24);
                 }
 
+                {
+                /* ADLX first: on RDNA4 (RX 9070 series) the legacy ADL
+                 * sensor queries return nothing. */
+                int adlx_idx;
+                int adlx_matched =
+                    adlx_find_by_pci_topology(amd_pci.pciDomain,
+                                              amd_pci.pciBus,
+                                              amd_pci.pciDevice,
+                                              amd_pci.pciFunction,
+                                              &adlx_idx) == 0 ||
+                    adlx_find_by_pci(props.vendorID, props.deviceID,
+                                     &adlx_idx) == 0;
+                if (adlx_matched) {
+                    int t, rpm, pct, core_mhz, mem_mhz, pwr;
+                    uint64_t mem_used = 0, mem_total = 0;
+
+                    printf("\n  --- AMD Dynamic Info (ADLX) ---\n");
+                    if (adlx_get_temperature(adlx_idx, &t) == 0)
+                        printf("  GPU Temperature : %.1f C\n", t / 1000.0);
+                    else
+                        printf("  GPU Temperature : N/A\n");
+
+                    if (adlx_get_fan_speed(adlx_idx, &rpm, &pct) == 0) {
+                        if (pct >= 0)
+                            printf("  Fan Speed       : %d%% (%d RPM)\n",
+                                   pct, rpm);
+                        else
+                            printf("  Fan Speed       : %d RPM\n", rpm);
+                    } else
+                        printf("  Fan Speed       : N/A\n");
+
+                    if (adlx_get_utilization(adlx_idx, &pct) == 0)
+                        printf("  GPU Utilization : %d%% (ADLX)\n", pct);
+                    else
+                        printf("  GPU Utilization : N/A\n");
+
+                    if (adlx_get_clocks(adlx_idx, &core_mhz, &mem_mhz) == 0) {
+                        if (core_mhz > 0)
+                            printf("  Engine Clock    : %d MHz\n", core_mhz);
+                        else
+                            printf("  Engine Clock    : N/A\n");
+                        if (mem_mhz > 0)
+                            printf("  Memory Clock    : %d MHz\n", mem_mhz);
+                        else
+                            printf("  Memory Clock    : N/A\n");
+                    } else {
+                        printf("  Engine Clock    : N/A\n");
+                        printf("  Memory Clock    : N/A\n");
+                    }
+
+                    if (adlx_get_power(adlx_idx, &pwr) == 0 && pwr > 0)
+                        printf("  GPU Power       : %.1f W\n", pwr / 1000.0);
+                    else
+                        printf("  GPU Power       : N/A\n");
+
+                    if (adlx_get_memory(adlx_idx, &mem_used, &mem_total) == 0 &&
+                        mem_used > 0 && mem_total > 0)
+                        printf("  Memory Usage    : %llu / %llu MB\n",
+                               (unsigned long long)(mem_used / (1024ULL * 1024ULL)),
+                               (unsigned long long)(mem_total / (1024ULL * 1024ULL)));
+                    else
+                        printf("  Memory Usage    : N/A\n");
+                }
+                if (!adlx_matched) {
                 printf("\n  --- AMD Dynamic Info (ADL) ---\n");
                 /* Prefer PCI topology so two identical AMD GPUs don't
                  * collapse onto adapter 0; fall back to name. */
@@ -1617,6 +1758,8 @@ static int do_output(int argc, char *argv[],
                 } else {
                     printf("  (could not match ADL adapter)\n");
                 }
+                } /* -- end ADL fallback -- */
+                } /* -- end ADLX/ADL selection -- */
             }
 #endif
 
@@ -2206,6 +2349,7 @@ int main(int argc, char *argv[])
     if (instance != VK_NULL_HANDLE) {
 #ifdef _WIN32
         adl_init();
+        adlx_init();
         intel_init();
         winmem_init();
 #endif
@@ -2383,6 +2527,7 @@ int main(int argc, char *argv[])
 #ifdef _WIN32
     winmem_shutdown();
     adl_shutdown();
+    adlx_shutdown();
     intel_shutdown();
 #endif
 #ifdef __linux__
