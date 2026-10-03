@@ -34,6 +34,7 @@ add_executable(gpu-info
     src/main.c
     src/backend_vulkan.c
     src/backend_adl.c
+    src/backend_adlx.c
     src/backend_intel.c
     src/backend_sysfs.c
     src/backend_nvml.c
@@ -43,6 +44,9 @@ add_executable(gpu-info
 
 # Vulkan loaded dynamically via backend_vulkan.c -- no import library needed
 target_include_directories(gpu-info PRIVATE ${Vulkan_INCLUDE_DIRS})
+
+# Vendored ADLX SDK headers (backend_adlx.c, Windows only)
+target_include_directories(gpu-info PRIVATE ${CMAKE_SOURCE_DIR}/third_party/adlx/include)
 
 # Embed VERSIONINFO resource on Windows (reduces heuristic AV false positives).
 # Linux/macOS skip the .rc entirely.
